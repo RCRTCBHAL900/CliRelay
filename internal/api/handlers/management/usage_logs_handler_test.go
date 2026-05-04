@@ -474,7 +474,7 @@ func TestGetAuthFileTrendUsesWeeklyResetCycleForRequestTotal(t *testing.T) {
 		t.Fatalf("register auth: %v", err)
 	}
 
-	now := time.Date(2026, 4, 30, 16, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
 	resetAt := now.Add(4 * 24 * time.Hour)
 	cycleStart := resetAt.Add(-7 * 24 * time.Hour)
 
