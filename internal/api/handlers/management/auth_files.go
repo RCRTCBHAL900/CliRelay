@@ -1169,6 +1169,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		Label                 *string   `json:"label"`
 		CustomTags            *[]string `json:"custom_tags"`
 		HiddenDefaultTags     *[]string `json:"hidden_default_tags"`
+		DisplayTags           *[]string `json:"display_tags"`
 		Prefix                *string   `json:"prefix"`
 		ProxyURL              *string   `json:"proxy_url"`
 		ProxyID               *string   `json:"proxy_id"`
@@ -1274,6 +1275,14 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		} else {
 			targetAuth.Metadata["hidden_default_tags"] = tags
 		}
+		changed = true
+	}
+	if req.DisplayTags != nil {
+		tags := normalizeTagList(*req.DisplayTags)
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		targetAuth.Metadata["display_tags"] = tags
 		changed = true
 	}
 	if req.ProxyURL != nil {
