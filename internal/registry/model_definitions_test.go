@@ -11,7 +11,7 @@ func TestClaudeStaticModelsIncludeLatestOpusModels(t *testing.T) {
 		}
 	}
 
-	for _, id := range []string{"claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"} {
+	for _, id := range []string{"claude-haiku-4-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"} {
 		if !modelIDs[id] {
 			t.Fatalf("expected claude static models to include %q", id)
 		}

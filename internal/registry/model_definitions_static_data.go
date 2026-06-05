@@ -7,6 +7,17 @@ func GetClaudeModels() []*ModelInfo {
 	return []*ModelInfo{
 
 		{
+			ID:                  "claude-haiku-4-5",
+			Object:              "model",
+			Created:             1759276800, // 2025-10-01
+			OwnedBy:             "anthropic",
+			Type:                "claude",
+			DisplayName:         "Claude 4.5 Haiku",
+			ContextLength:       200000,
+			MaxCompletionTokens: 64000,
+			Thinking:            &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: false},
+		},
+		{
 			ID:                  "claude-haiku-4-5-20251001",
 			Object:              "model",
 			Created:             1759276800, // 2025-10-01
