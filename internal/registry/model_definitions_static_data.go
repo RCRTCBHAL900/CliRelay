@@ -40,6 +40,30 @@ func GetClaudeModels() []*ModelInfo {
 			Thinking:            &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: false},
 		},
 		{
+			ID:                  "claude-opus-4-8",
+			Object:              "model",
+			Created:             1773964800, // 2026-03-19
+			OwnedBy:             "anthropic",
+			Type:                "claude",
+			DisplayName:         "Claude 4.8 Opus",
+			Description:         "Latest premium Claude model with adaptive thinking support",
+			ContextLength:       1000000,
+			MaxCompletionTokens: 128000,
+			Thinking:            &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true},
+		},
+		{
+			ID:                  "claude-opus-4-7",
+			Object:              "model",
+			Created:             1773014400, // 2026-03-08
+			OwnedBy:             "anthropic",
+			Type:                "claude",
+			DisplayName:         "Claude 4.7 Opus",
+			Description:         "Premium Claude model with extended context and adaptive thinking support",
+			ContextLength:       1000000,
+			MaxCompletionTokens: 128000,
+			Thinking:            &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true},
+		},
+		{
 			ID:                  "claude-opus-4-6",
 			Object:              "model",
 			Created:             1770318000, // 2026-02-05
@@ -1024,6 +1048,10 @@ func GetAntigravityModelConfig() map[string]*AntigravityModelConfig {
 		"gemini-3-flash":             {Thinking: &ThinkingSupport{Min: 128, Max: 32768, ZeroAllowed: false, DynamicAllowed: true, Levels: []string{"minimal", "low", "medium", "high"}}},
 		"gemini-3-flash-agent":       {Thinking: &ThinkingSupport{Min: 32, Max: 32768, ZeroAllowed: false, DynamicAllowed: true, Levels: []string{"minimal", "low", "medium", "high"}}},
 		"gemini-3.1-flash-image":     {},
+		"claude-opus-4-8":            {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 128000},
+		"claude-opus-4-8-thinking":   {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 128000},
+		"claude-opus-4-7":            {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 128000},
+		"claude-opus-4-7-thinking":   {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 128000},
 		"claude-sonnet-4-5-thinking": {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 64000},
 		"claude-opus-4-5-thinking":   {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 64000},
 		"claude-opus-4-6-thinking":   {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 64000},
