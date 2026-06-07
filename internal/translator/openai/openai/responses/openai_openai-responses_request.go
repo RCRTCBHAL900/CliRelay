@@ -7,6 +7,8 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+const missingReasoningPlaceholder = "[reasoning unavailable]"
+
 // ConvertOpenAIResponsesRequestToOpenAIChatCompletions converts OpenAI responses format to OpenAI chat completions format.
 // It transforms the OpenAI responses API format (with instructions and input array) into the standard
 // OpenAI chat completions format (with messages array and system content).
@@ -57,7 +59,11 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 	// Convert input array to messages
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
-		input.ForEach(func(_, item gjson.Result) bool {
+		items := input.Array()
+		pendingReasoning := ""
+		pendingReasoningExists := false
+		for i := 0; i < len(items); i++ {
+			item := items[i]
 			itemType := item.Get("type").String()
 			if itemType == "" && item.Get("role").String() != "" {
 				itemType = "message"
@@ -72,10 +78,10 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 				message := `{"role":"","content":[]}`
 				message, _ = sjson.Set(message, "role", role)
+				var toolCalls []interface{}
 
 				if content := item.Get("content"); content.Exists() && content.IsArray() {
 					var messageContent string
-					var toolCalls []interface{}
 
 					content.ForEach(func(_, contentItem gjson.Result) bool {
 						contentType := contentItem.Get("type").String()
@@ -109,27 +115,47 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					message, _ = sjson.Set(message, "content", content.String())
 				}
 
+				if role == "assistant" {
+					for next := i + 1; next < len(items); next++ {
+						if items[next].Get("type").String() != "function_call" {
+							break
+						}
+						toolCalls = append(toolCalls, buildToolCall(items[next]).Value())
+						i = next
+					}
+					if len(toolCalls) > 0 {
+						message, _ = sjson.Set(message, "tool_calls", toolCalls)
+					}
+				}
+
+				if role == "assistant" && pendingReasoningExists {
+					message, _ = sjson.Set(message, "reasoning_content", pendingReasoning)
+					pendingReasoning = ""
+					pendingReasoningExists = false
+				}
+
 				out, _ = sjson.SetRaw(out, "messages.-1", message)
 
 			case "function_call":
-				// Handle function call conversion to assistant message with tool_calls
+				// Responses history may contain several consecutive function_call items before
+				// their corresponding function_call_output items. Chat Completions requires
+				// those sibling tool calls to share a single assistant message so the tool
+				// outputs can follow immediately after.
 				assistantMessage := `{"role":"assistant","tool_calls":[]}`
+				for ; i < len(items); i++ {
+					groupedItem := items[i]
+					if groupedItem.Get("type").String() != "function_call" {
+						i--
+						break
+					}
 
-				toolCall := `{"id":"","type":"function","function":{"name":"","arguments":""}}`
-
-				if callId := item.Get("call_id"); callId.Exists() {
-					toolCall, _ = sjson.Set(toolCall, "id", callId.String())
+					assistantMessage, _ = sjson.SetRaw(assistantMessage, "tool_calls.-1", buildToolCall(groupedItem).Raw)
 				}
-
-				if name := item.Get("name"); name.Exists() {
-					toolCall, _ = sjson.Set(toolCall, "function.name", name.String())
+				if pendingReasoningExists {
+					assistantMessage, _ = sjson.Set(assistantMessage, "reasoning_content", pendingReasoning)
+					pendingReasoning = ""
+					pendingReasoningExists = false
 				}
-
-				if arguments := item.Get("arguments"); arguments.Exists() {
-					toolCall, _ = sjson.Set(toolCall, "function.arguments", arguments.String())
-				}
-
-				assistantMessage, _ = sjson.SetRaw(assistantMessage, "tool_calls.0", toolCall)
 				out, _ = sjson.SetRaw(out, "messages.-1", assistantMessage)
 
 			case "function_call_output":
@@ -145,10 +171,13 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 
 				out, _ = sjson.SetRaw(out, "messages.-1", toolMessage)
+
+			case "reasoning":
+				pendingReasoning = collectReasoningContent(item)
+				pendingReasoningExists = true
 			}
 
-			return true
-		})
+		}
 	} else if input.Type == gjson.String {
 		msg := "{}"
 		msg, _ = sjson.Set(msg, "role", "user")
@@ -211,4 +240,39 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	}
 
 	return []byte(out)
+}
+
+func collectReasoningContent(item gjson.Result) string {
+	var parts []string
+	if summary := item.Get("summary"); summary.Exists() && summary.IsArray() {
+		summary.ForEach(func(_, part gjson.Result) bool {
+			text := strings.TrimSpace(part.Get("text").String())
+			if text != "" {
+				parts = append(parts, text)
+			}
+			return true
+		})
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, "\n\n")
+	}
+	return missingReasoningPlaceholder
+}
+
+func buildToolCall(item gjson.Result) gjson.Result {
+	toolCall := `{"id":"","type":"function","function":{"name":"","arguments":""}}`
+
+	if callID := item.Get("call_id"); callID.Exists() {
+		toolCall, _ = sjson.Set(toolCall, "id", callID.String())
+	}
+
+	if name := item.Get("name"); name.Exists() {
+		toolCall, _ = sjson.Set(toolCall, "function.name", name.String())
+	}
+
+	if arguments := item.Get("arguments"); arguments.Exists() {
+		toolCall, _ = sjson.Set(toolCall, "function.arguments", arguments.String())
+	}
+
+	return gjson.Parse(toolCall)
 }

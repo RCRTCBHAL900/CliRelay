@@ -28,16 +28,18 @@ type oaiToResponsesState struct {
 	MsgTextBuf   map[int]*strings.Builder
 	ReasoningBuf strings.Builder
 	Reasonings   []oaiToResponsesStateReasoning
-	FuncArgsBuf  map[int]*strings.Builder // index -> args
-	FuncNames    map[int]string           // index -> name
-	FuncCallIDs  map[int]string           // index -> call_id
+	FuncArgsBuf  map[string]*strings.Builder // slot -> args
+	FuncNames    map[string]string           // slot -> name
+	FuncCallIDs  map[string]string           // slot -> call_id
+	FuncOutIdx   map[string]int              // slot -> output index
+	FuncOrder    []string                    // slot order
 	// message item state per output index
 	MsgItemAdded    map[int]bool // whether response.output_item.added emitted for message
 	MsgContentAdded map[int]bool // whether response.content_part.added emitted for message
 	MsgItemDone     map[int]bool // whether message done events were emitted
 	// function item done state
-	FuncArgsDone map[int]bool
-	FuncItemDone map[int]bool
+	FuncArgsDone map[string]bool
+	FuncItemDone map[string]bool
 	// usage aggregation
 	PromptTokens     int64
 	CachedTokens     int64
@@ -59,15 +61,17 @@ func emitRespEvent(event string, payload string) string {
 func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []string {
 	if *param == nil {
 		*param = &oaiToResponsesState{
-			FuncArgsBuf:     make(map[int]*strings.Builder),
-			FuncNames:       make(map[int]string),
-			FuncCallIDs:     make(map[int]string),
+			FuncArgsBuf:     make(map[string]*strings.Builder),
+			FuncNames:       make(map[string]string),
+			FuncCallIDs:     make(map[string]string),
+			FuncOutIdx:      make(map[string]int),
+			FuncOrder:       make([]string, 0),
 			MsgTextBuf:      make(map[int]*strings.Builder),
 			MsgItemAdded:    make(map[int]bool),
 			MsgContentAdded: make(map[int]bool),
 			MsgItemDone:     make(map[int]bool),
-			FuncArgsDone:    make(map[int]bool),
-			FuncItemDone:    make(map[int]bool),
+			FuncArgsDone:    make(map[string]bool),
+			FuncItemDone:    make(map[string]bool),
 			Reasonings:      make([]oaiToResponsesStateReasoning, 0),
 		}
 	}
@@ -134,14 +138,16 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		st.ReasoningBuf.Reset()
 		st.ReasoningID = ""
 		st.ReasoningIndex = 0
-		st.FuncArgsBuf = make(map[int]*strings.Builder)
-		st.FuncNames = make(map[int]string)
-		st.FuncCallIDs = make(map[int]string)
+		st.FuncArgsBuf = make(map[string]*strings.Builder)
+		st.FuncNames = make(map[string]string)
+		st.FuncCallIDs = make(map[string]string)
+		st.FuncOutIdx = make(map[string]int)
+		st.FuncOrder = make([]string, 0)
 		st.MsgItemAdded = make(map[int]bool)
 		st.MsgContentAdded = make(map[int]bool)
 		st.MsgItemDone = make(map[int]bool)
-		st.FuncArgsDone = make(map[int]bool)
-		st.FuncItemDone = make(map[int]bool)
+		st.FuncArgsDone = make(map[string]bool)
+		st.FuncItemDone = make(map[string]bool)
 		st.PromptTokens = 0
 		st.CachedTokens = 0
 		st.CompletionTokens = 0
@@ -297,55 +303,213 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 						st.MsgItemDone[idx] = true
 					}
 
-					// Only emit item.added once per tool call and preserve call_id across chunks.
-					newCallID := tcs.Get("0.id").String()
-					nameChunk := tcs.Get("0.function.name").String()
-					if nameChunk != "" {
-						st.FuncNames[idx] = nameChunk
-					}
-					existingCallID := st.FuncCallIDs[idx]
-					effectiveCallID := existingCallID
-					shouldEmitItem := false
-					if existingCallID == "" && newCallID != "" {
-						// First time seeing a valid call_id for this index
-						effectiveCallID = newCallID
-						st.FuncCallIDs[idx] = newCallID
-						shouldEmitItem = true
-					}
-
-					if shouldEmitItem && effectiveCallID != "" {
-						o := `{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"in_progress","arguments":"","call_id":"","name":""}}`
-						o, _ = sjson.Set(o, "sequence_number", nextSeq())
-						o, _ = sjson.Set(o, "output_index", idx)
-						o, _ = sjson.Set(o, "item.id", fmt.Sprintf("fc_%s", effectiveCallID))
-						o, _ = sjson.Set(o, "item.call_id", effectiveCallID)
-						name := st.FuncNames[idx]
-						o, _ = sjson.Set(o, "item.name", name)
-						out = append(out, emitRespEvent("response.output_item.added", o))
-					}
-
-					// Ensure args buffer exists for this index
-					if st.FuncArgsBuf[idx] == nil {
-						st.FuncArgsBuf[idx] = &strings.Builder{}
-					}
-
-					// Append arguments delta if available and we have a valid call_id to reference
-					if args := tcs.Get("0.function.arguments"); args.Exists() && args.String() != "" {
-						// Prefer an already known call_id; fall back to newCallID if first time
-						refCallID := st.FuncCallIDs[idx]
-						if refCallID == "" {
-							refCallID = newCallID
+					tcs.ForEach(func(tcPos, tc gjson.Result) bool {
+						callPos := int(tcPos.Int())
+						if v := tc.Get("index"); v.Exists() {
+							callPos = int(v.Int())
 						}
-						if refCallID != "" {
-							ad := `{"type":"response.function_call_arguments.delta","sequence_number":0,"item_id":"","output_index":0,"delta":""}`
-							ad, _ = sjson.Set(ad, "sequence_number", nextSeq())
-							ad, _ = sjson.Set(ad, "item_id", fmt.Sprintf("fc_%s", refCallID))
-							ad, _ = sjson.Set(ad, "output_index", idx)
-							ad, _ = sjson.Set(ad, "delta", args.String())
-							out = append(out, emitRespEvent("response.function_call_arguments.delta", ad))
+						slotKey := fmt.Sprintf("%d:%d", idx, callPos)
+						st.FuncOutIdx[slotKey] = idx
+						if _, ok := st.FuncArgsBuf[slotKey]; !ok {
+							st.FuncArgsBuf[slotKey] = &strings.Builder{}
+							st.FuncOrder = append(st.FuncOrder, slotKey)
 						}
-						st.FuncArgsBuf[idx].WriteString(args.String())
+
+						newCallID := tc.Get("id").String()
+						if nameChunk := tc.Get("function.name").String(); nameChunk != "" {
+							st.FuncNames[slotKey] = nameChunk
+						}
+						existingCallID := st.FuncCallIDs[slotKey]
+						effectiveCallID := existingCallID
+						shouldEmitItem := false
+						if existingCallID == "" && newCallID != "" {
+							effectiveCallID = newCallID
+							st.FuncCallIDs[slotKey] = newCallID
+							shouldEmitItem = true
+						}
+
+						if shouldEmitItem && effectiveCallID != "" {
+							o := `{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"in_progress","arguments":"","call_id":"","name":""}}`
+							o, _ = sjson.Set(o, "sequence_number", nextSeq())
+							o, _ = sjson.Set(o, "output_index", idx)
+							o, _ = sjson.Set(o, "item.id", fmt.Sprintf("fc_%s", effectiveCallID))
+							o, _ = sjson.Set(o, "item.call_id", effectiveCallID)
+							o, _ = sjson.Set(o, "item.name", st.FuncNames[slotKey])
+							out = append(out, emitRespEvent("response.output_item.added", o))
+						}
+
+						if args := tc.Get("function.arguments"); args.Exists() && args.String() != "" {
+							refCallID := st.FuncCallIDs[slotKey]
+							if refCallID == "" {
+								refCallID = newCallID
+							}
+							if refCallID != "" {
+								ad := `{"type":"response.function_call_arguments.delta","sequence_number":0,"item_id":"","output_index":0,"delta":""}`
+								ad, _ = sjson.Set(ad, "sequence_number", nextSeq())
+								ad, _ = sjson.Set(ad, "item_id", fmt.Sprintf("fc_%s", refCallID))
+								ad, _ = sjson.Set(ad, "output_index", idx)
+								ad, _ = sjson.Set(ad, "delta", args.String())
+								out = append(out, emitRespEvent("response.function_call_arguments.delta", ad))
+							}
+							st.FuncArgsBuf[slotKey].WriteString(args.String())
+						}
+						return true
+					})
+				}
+			}
+
+			// Some OpenAI-compatible providers may emit a full assistant message
+			// inside a streaming chunk instead of incremental delta fields.
+			// Preserve those one-shot chunks so Codex still receives the final
+			// assistant text/tool calls instead of an empty response.completed.
+			if msg := choice.Get("message"); msg.Exists() {
+				if rc := msg.Get("reasoning_content"); rc.Exists() && rc.String() != "" {
+					if st.ReasoningID == "" {
+						st.ReasoningID = fmt.Sprintf("rs_%s_%d", st.ResponseID, idx)
+						st.ReasoningIndex = idx
+						item := `{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"reasoning","status":"in_progress","summary":[]}}`
+						item, _ = sjson.Set(item, "sequence_number", nextSeq())
+						item, _ = sjson.Set(item, "output_index", idx)
+						item, _ = sjson.Set(item, "item.id", st.ReasoningID)
+						out = append(out, emitRespEvent("response.output_item.added", item))
+						part := `{"type":"response.reasoning_summary_part.added","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}`
+						part, _ = sjson.Set(part, "sequence_number", nextSeq())
+						part, _ = sjson.Set(part, "item_id", st.ReasoningID)
+						part, _ = sjson.Set(part, "output_index", st.ReasoningIndex)
+						out = append(out, emitRespEvent("response.reasoning_summary_part.added", part))
 					}
+					st.ReasoningBuf.WriteString(rc.String())
+					msg := `{"type":"response.reasoning_summary_text.delta","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"delta":""}`
+					msg, _ = sjson.Set(msg, "sequence_number", nextSeq())
+					msg, _ = sjson.Set(msg, "item_id", st.ReasoningID)
+					msg, _ = sjson.Set(msg, "output_index", st.ReasoningIndex)
+					msg, _ = sjson.Set(msg, "delta", rc.String())
+					out = append(out, emitRespEvent("response.reasoning_summary_text.delta", msg))
+				}
+
+				if c := msg.Get("content"); c.Exists() && c.String() != "" {
+					if st.ReasoningID != "" {
+						stopReasoning(st.ReasoningBuf.String())
+						st.ReasoningBuf.Reset()
+					}
+					if !st.MsgItemAdded[idx] {
+						item := `{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"in_progress","content":[],"role":"assistant"}}`
+						item, _ = sjson.Set(item, "sequence_number", nextSeq())
+						item, _ = sjson.Set(item, "output_index", idx)
+						item, _ = sjson.Set(item, "item.id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
+						out = append(out, emitRespEvent("response.output_item.added", item))
+						st.MsgItemAdded[idx] = true
+					}
+					if !st.MsgContentAdded[idx] {
+						part := `{"type":"response.content_part.added","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}`
+						part, _ = sjson.Set(part, "sequence_number", nextSeq())
+						part, _ = sjson.Set(part, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
+						part, _ = sjson.Set(part, "output_index", idx)
+						part, _ = sjson.Set(part, "content_index", 0)
+						out = append(out, emitRespEvent("response.content_part.added", part))
+						st.MsgContentAdded[idx] = true
+					}
+
+					msgDelta := `{"type":"response.output_text.delta","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"delta":"","logprobs":[]}`
+					msgDelta, _ = sjson.Set(msgDelta, "sequence_number", nextSeq())
+					msgDelta, _ = sjson.Set(msgDelta, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
+					msgDelta, _ = sjson.Set(msgDelta, "output_index", idx)
+					msgDelta, _ = sjson.Set(msgDelta, "content_index", 0)
+					msgDelta, _ = sjson.Set(msgDelta, "delta", c.String())
+					out = append(out, emitRespEvent("response.output_text.delta", msgDelta))
+					if st.MsgTextBuf[idx] == nil {
+						st.MsgTextBuf[idx] = &strings.Builder{}
+					}
+					st.MsgTextBuf[idx].WriteString(c.String())
+				}
+
+				if tcs := msg.Get("tool_calls"); tcs.Exists() && tcs.IsArray() {
+					if st.ReasoningID != "" {
+						stopReasoning(st.ReasoningBuf.String())
+						st.ReasoningBuf.Reset()
+					}
+					if st.MsgItemAdded[idx] && !st.MsgItemDone[idx] {
+						fullText := ""
+						if b := st.MsgTextBuf[idx]; b != nil {
+							fullText = b.String()
+						}
+						done := `{"type":"response.output_text.done","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"text":"","logprobs":[]}`
+						done, _ = sjson.Set(done, "sequence_number", nextSeq())
+						done, _ = sjson.Set(done, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
+						done, _ = sjson.Set(done, "output_index", idx)
+						done, _ = sjson.Set(done, "content_index", 0)
+						done, _ = sjson.Set(done, "text", fullText)
+						out = append(out, emitRespEvent("response.output_text.done", done))
+
+						partDone := `{"type":"response.content_part.done","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}`
+						partDone, _ = sjson.Set(partDone, "sequence_number", nextSeq())
+						partDone, _ = sjson.Set(partDone, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
+						partDone, _ = sjson.Set(partDone, "output_index", idx)
+						partDone, _ = sjson.Set(partDone, "content_index", 0)
+						partDone, _ = sjson.Set(partDone, "part.text", fullText)
+						out = append(out, emitRespEvent("response.content_part.done", partDone))
+
+						itemDone := `{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}}`
+						itemDone, _ = sjson.Set(itemDone, "sequence_number", nextSeq())
+						itemDone, _ = sjson.Set(itemDone, "output_index", idx)
+						itemDone, _ = sjson.Set(itemDone, "item.id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
+						itemDone, _ = sjson.Set(itemDone, "item.content.0.text", fullText)
+						out = append(out, emitRespEvent("response.output_item.done", itemDone))
+						st.MsgItemDone[idx] = true
+					}
+
+					tcs.ForEach(func(tcPos, tc gjson.Result) bool {
+						callPos := int(tcPos.Int())
+						if v := tc.Get("index"); v.Exists() {
+							callPos = int(v.Int())
+						}
+						slotKey := fmt.Sprintf("%d:%d", idx, callPos)
+						st.FuncOutIdx[slotKey] = idx
+						if _, ok := st.FuncArgsBuf[slotKey]; !ok {
+							st.FuncArgsBuf[slotKey] = &strings.Builder{}
+							st.FuncOrder = append(st.FuncOrder, slotKey)
+						}
+
+						newCallID := tc.Get("id").String()
+						if nameChunk := tc.Get("function.name").String(); nameChunk != "" {
+							st.FuncNames[slotKey] = nameChunk
+						}
+						existingCallID := st.FuncCallIDs[slotKey]
+						effectiveCallID := existingCallID
+						shouldEmitItem := false
+						if existingCallID == "" && newCallID != "" {
+							effectiveCallID = newCallID
+							st.FuncCallIDs[slotKey] = newCallID
+							shouldEmitItem = true
+						}
+
+						if shouldEmitItem && effectiveCallID != "" {
+							o := `{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"in_progress","arguments":"","call_id":"","name":""}}`
+							o, _ = sjson.Set(o, "sequence_number", nextSeq())
+							o, _ = sjson.Set(o, "output_index", idx)
+							o, _ = sjson.Set(o, "item.id", fmt.Sprintf("fc_%s", effectiveCallID))
+							o, _ = sjson.Set(o, "item.call_id", effectiveCallID)
+							o, _ = sjson.Set(o, "item.name", st.FuncNames[slotKey])
+							out = append(out, emitRespEvent("response.output_item.added", o))
+						}
+
+						if args := tc.Get("function.arguments"); args.Exists() && args.String() != "" {
+							refCallID := st.FuncCallIDs[slotKey]
+							if refCallID == "" {
+								refCallID = newCallID
+							}
+							if refCallID != "" {
+								ad := `{"type":"response.function_call_arguments.delta","sequence_number":0,"item_id":"","output_index":0,"delta":""}`
+								ad, _ = sjson.Set(ad, "sequence_number", nextSeq())
+								ad, _ = sjson.Set(ad, "item_id", fmt.Sprintf("fc_%s", refCallID))
+								ad, _ = sjson.Set(ad, "output_index", idx)
+								ad, _ = sjson.Set(ad, "delta", args.String())
+								out = append(out, emitRespEvent("response.function_call_arguments.delta", ad))
+							}
+							st.FuncArgsBuf[slotKey].WriteString(args.String())
+						}
+						return true
+					})
 				}
 			}
 
@@ -405,44 +569,34 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 				}
 
 				// Emit function call done events for any active function calls
-				if len(st.FuncCallIDs) > 0 {
-					idxs := make([]int, 0, len(st.FuncCallIDs))
-					for i := range st.FuncCallIDs {
-						idxs = append(idxs, i)
-					}
-					for i := 0; i < len(idxs); i++ {
-						for j := i + 1; j < len(idxs); j++ {
-							if idxs[j] < idxs[i] {
-								idxs[i], idxs[j] = idxs[j], idxs[i]
-							}
-						}
-					}
-					for _, i := range idxs {
-						callID := st.FuncCallIDs[i]
-						if callID == "" || st.FuncItemDone[i] {
+				if len(st.FuncOrder) > 0 {
+					for _, slotKey := range st.FuncOrder {
+						callID := st.FuncCallIDs[slotKey]
+						if callID == "" || st.FuncItemDone[slotKey] {
 							continue
 						}
 						args := "{}"
-						if b := st.FuncArgsBuf[i]; b != nil && b.Len() > 0 {
+						if b := st.FuncArgsBuf[slotKey]; b != nil && b.Len() > 0 {
 							args = b.String()
 						}
+						outputIdx := st.FuncOutIdx[slotKey]
 						fcDone := `{"type":"response.function_call_arguments.done","sequence_number":0,"item_id":"","output_index":0,"arguments":""}`
 						fcDone, _ = sjson.Set(fcDone, "sequence_number", nextSeq())
 						fcDone, _ = sjson.Set(fcDone, "item_id", fmt.Sprintf("fc_%s", callID))
-						fcDone, _ = sjson.Set(fcDone, "output_index", i)
+						fcDone, _ = sjson.Set(fcDone, "output_index", outputIdx)
 						fcDone, _ = sjson.Set(fcDone, "arguments", args)
 						out = append(out, emitRespEvent("response.function_call_arguments.done", fcDone))
 
 						itemDone := `{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}}`
 						itemDone, _ = sjson.Set(itemDone, "sequence_number", nextSeq())
-						itemDone, _ = sjson.Set(itemDone, "output_index", i)
+						itemDone, _ = sjson.Set(itemDone, "output_index", outputIdx)
 						itemDone, _ = sjson.Set(itemDone, "item.id", fmt.Sprintf("fc_%s", callID))
 						itemDone, _ = sjson.Set(itemDone, "item.arguments", args)
 						itemDone, _ = sjson.Set(itemDone, "item.call_id", callID)
-						itemDone, _ = sjson.Set(itemDone, "item.name", st.FuncNames[i])
+						itemDone, _ = sjson.Set(itemDone, "item.name", st.FuncNames[slotKey])
 						out = append(out, emitRespEvent("response.output_item.done", itemDone))
-						st.FuncItemDone[i] = true
-						st.FuncArgsDone[i] = true
+						st.FuncItemDone[slotKey] = true
+						st.FuncArgsDone[slotKey] = true
 					}
 				}
 				completed := `{"type":"response.completed","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null}}`
@@ -547,26 +701,17 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 						outputsWrapper, _ = sjson.SetRaw(outputsWrapper, "arr.-1", item)
 					}
 				}
-				if len(st.FuncArgsBuf) > 0 {
-					idxs := make([]int, 0, len(st.FuncArgsBuf))
-					for i := range st.FuncArgsBuf {
-						idxs = append(idxs, i)
-					}
-					// small-N sort without extra imports
-					for i := 0; i < len(idxs); i++ {
-						for j := i + 1; j < len(idxs); j++ {
-							if idxs[j] < idxs[i] {
-								idxs[i], idxs[j] = idxs[j], idxs[i]
-							}
-						}
-					}
-					for _, i := range idxs {
+				if len(st.FuncOrder) > 0 {
+					for _, slotKey := range st.FuncOrder {
 						args := ""
-						if b := st.FuncArgsBuf[i]; b != nil {
+						if b := st.FuncArgsBuf[slotKey]; b != nil {
 							args = b.String()
 						}
-						callID := st.FuncCallIDs[i]
-						name := st.FuncNames[i]
+						callID := st.FuncCallIDs[slotKey]
+						name := st.FuncNames[slotKey]
+						if callID == "" {
+							continue
+						}
 						item := `{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`
 						item, _ = sjson.Set(item, "id", fmt.Sprintf("fc_%s", callID))
 						item, _ = sjson.Set(item, "arguments", args)
