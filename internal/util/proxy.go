@@ -22,6 +22,7 @@ const (
 	DefaultHTTPTLSHandshakeTimeout  = 10 * time.Second
 	DefaultHTTPResponseHeaderTimout = 30 * time.Second
 	DefaultHTTPIdleConnTimeout      = 90 * time.Second
+	SourceIPProxyScheme             = "sourceip"
 )
 
 func NewHTTPClient(timeout time.Duration) *http.Client {
@@ -89,11 +90,40 @@ func BuildProxyTransport(proxyURL string, preferIPv4 bool) *http.Transport {
 		}
 	case "http", "https":
 		transport.Proxy = http.ProxyURL(parsedURL)
+	case SourceIPProxyScheme:
+		transport = BuildSourceIPTransport(parsedURL.Host, preferIPv4)
 	default:
 		log.Errorf("unsupported proxy scheme: %s", parsedURL.Scheme)
 		return nil
 	}
 
+	return transport
+}
+
+func BuildSourceIPTransport(sourceIP string, preferIPv4 bool) *http.Transport {
+	parsedIP := net.ParseIP(strings.TrimSpace(sourceIP))
+	if parsedIP == nil {
+		log.Errorf("invalid source ip: %s", sourceIP)
+		return nil
+	}
+	if parsedIP = parsedIP.To4(); parsedIP == nil {
+		log.Errorf("source ip must be IPv4: %s", sourceIP)
+		return nil
+	}
+
+	transport := NewDefaultTransport(preferIPv4)
+	dialer := &net.Dialer{
+		Timeout:   DefaultHTTPDialTimeout,
+		KeepAlive: 30 * time.Second,
+		LocalAddr: &net.TCPAddr{IP: parsedIP},
+	}
+	transport.Proxy = nil
+	transport.DialContext = dialer.DialContext
+	if preferIPv4 {
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp4", addr)
+		}
+	}
 	return transport
 }
 

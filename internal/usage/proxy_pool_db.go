@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS proxy_pool (
   id          TEXT PRIMARY KEY NOT NULL,
   name        TEXT NOT NULL DEFAULT '',
   url         TEXT NOT NULL,
+  source_ip   TEXT NOT NULL DEFAULT '',
   enabled     INTEGER NOT NULL DEFAULT 1,
   description TEXT NOT NULL DEFAULT '',
   created_at  TEXT NOT NULL DEFAULT '',
@@ -29,6 +30,11 @@ func initProxyPoolTable(db *sql.DB) {
 	}
 	if _, err := db.Exec(createProxyPoolTableSQL); err != nil {
 		log.Errorf("usage: create proxy_pool table: %v", err)
+	}
+	if _, err := db.Exec("ALTER TABLE proxy_pool ADD COLUMN source_ip TEXT NOT NULL DEFAULT ''"); err != nil {
+		if !strings.Contains(err.Error(), "duplicate") {
+			log.Warnf("usage: migrate proxy_pool.source_ip: %v", err)
+		}
 	}
 }
 
@@ -44,7 +50,7 @@ func ListProxyPool() []config.ProxyPoolEntry {
 		return nil
 	}
 
-	rows, err := db.Query(`SELECT id, name, url, enabled, description FROM proxy_pool ORDER BY created_at ASC, id ASC`)
+	rows, err := db.Query(`SELECT id, name, url, source_ip, enabled, description FROM proxy_pool ORDER BY created_at ASC, id ASC`)
 	if err != nil {
 		log.Errorf("usage: list proxy_pool: %v", err)
 		return nil
@@ -75,7 +81,7 @@ func GetProxyPoolEntry(id string) *config.ProxyPoolEntry {
 	if normalizedID == "" {
 		return nil
 	}
-	row := db.QueryRow(`SELECT id, name, url, enabled, description FROM proxy_pool WHERE id = ?`, normalizedID)
+	row := db.QueryRow(`SELECT id, name, url, source_ip, enabled, description FROM proxy_pool WHERE id = ?`, normalizedID)
 	entry, ok := scanProxyPoolEntry(row)
 	if !ok {
 		return nil
@@ -104,8 +110,8 @@ func ReplaceProxyPool(entries []config.ProxyPoolEntry) error {
 	}
 
 	stmt, err := tx.Prepare(`INSERT INTO proxy_pool
-		(id, name, url, enabled, description, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`)
+		(id, name, url, source_ip, enabled, description, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		_ = tx.Rollback()
 		return err
@@ -118,7 +124,7 @@ func ReplaceProxyPool(entries []config.ProxyPoolEntry) error {
 		if entry.Enabled {
 			enabledInt = 1
 		}
-		if _, err := stmt.Exec(entry.ID, entry.Name, entry.URL, enabledInt, entry.Description, now, now); err != nil {
+		if _, err := stmt.Exec(entry.ID, entry.Name, entry.URL, entry.SourceIP, enabledInt, entry.Description, now, now); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -179,7 +185,7 @@ type proxyPoolScanner interface {
 func scanProxyPoolEntry(scanner proxyPoolScanner) (config.ProxyPoolEntry, bool) {
 	var entry config.ProxyPoolEntry
 	var enabledInt int
-	if err := scanner.Scan(&entry.ID, &entry.Name, &entry.URL, &enabledInt, &entry.Description); err != nil {
+	if err := scanner.Scan(&entry.ID, &entry.Name, &entry.URL, &entry.SourceIP, &enabledInt, &entry.Description); err != nil {
 		if err != sql.ErrNoRows {
 			log.Warnf("usage: scan proxy_pool row: %v", err)
 		}

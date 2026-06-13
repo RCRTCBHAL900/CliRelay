@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"unicode"
@@ -14,6 +15,7 @@ type ProxyPoolEntry struct {
 	ID          string `yaml:"id" json:"id"`
 	Name        string `yaml:"name" json:"name"`
 	URL         string `yaml:"url" json:"url"`
+	SourceIP    string `yaml:"source-ip,omitempty" json:"source-ip,omitempty"`
 	Enabled     bool   `yaml:"enabled" json:"enabled"`
 	Description string `yaml:"description,omitempty" json:"description,omitempty"`
 }
@@ -39,6 +41,22 @@ func ValidateProxyURL(raw string) error {
 	}
 }
 
+// ValidateSourceIP verifies that a source IP can be used for direct egress binding.
+func ValidateSourceIP(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fmt.Errorf("source ip is required")
+	}
+	parsed := net.ParseIP(trimmed)
+	if parsed == nil {
+		return fmt.Errorf("invalid source ip")
+	}
+	if parsed = parsed.To4(); parsed == nil {
+		return fmt.Errorf("source ip must be an IPv4 address")
+	}
+	return nil
+}
+
 // NormalizeProxyPool trims entries, removes invalid rows and keeps the first entry per ID.
 func NormalizeProxyPool(entries []ProxyPoolEntry) []ProxyPoolEntry {
 	if len(entries) == 0 {
@@ -50,12 +68,24 @@ func NormalizeProxyPool(entries []ProxyPoolEntry) []ProxyPoolEntry {
 		entry.ID = normalizeProxyID(entry.ID)
 		entry.Name = strings.TrimSpace(entry.Name)
 		entry.URL = strings.TrimSpace(entry.URL)
+		entry.SourceIP = strings.TrimSpace(entry.SourceIP)
 		entry.Description = strings.TrimSpace(entry.Description)
-		if entry.URL == "" || ValidateProxyURL(entry.URL) != nil {
+		if entry.URL == "" && entry.SourceIP == "" {
+			continue
+		}
+		if entry.URL != "" && ValidateProxyURL(entry.URL) != nil {
+			continue
+		}
+		if entry.SourceIP != "" && ValidateSourceIP(entry.SourceIP) != nil {
 			continue
 		}
 		if entry.ID == "" {
-			entry.ID = proxyIDFromURL(entry.URL)
+			switch {
+			case entry.SourceIP != "":
+				entry.ID = proxyIDFromSourceIP(entry.SourceIP)
+			case entry.URL != "":
+				entry.ID = proxyIDFromURL(entry.URL)
+			}
 		}
 		if entry.Name == "" {
 			entry.Name = entry.ID
@@ -86,8 +116,13 @@ func (cfg *Config) ResolveProxyURL(proxyID string, fallbackURL string) string {
 		id := normalizeProxyID(proxyID)
 		if id != "" {
 			for _, entry := range cfg.ProxyPool {
-				if entry.Enabled && normalizeProxyID(entry.ID) == id && strings.TrimSpace(entry.URL) != "" {
-					return strings.TrimSpace(entry.URL)
+				if entry.Enabled && normalizeProxyID(entry.ID) == id {
+					if strings.TrimSpace(entry.SourceIP) != "" {
+						return SourceIPTransportURL(entry.SourceIP)
+					}
+					if strings.TrimSpace(entry.URL) != "" {
+						return strings.TrimSpace(entry.URL)
+					}
 				}
 			}
 		}
@@ -125,4 +160,17 @@ func normalizeProxyID(raw string) string {
 func proxyIDFromURL(raw string) string {
 	sum := sha1.Sum([]byte(strings.TrimSpace(raw)))
 	return "proxy-" + hex.EncodeToString(sum[:])[:10]
+}
+
+func proxyIDFromSourceIP(raw string) string {
+	return "source-ip-" + normalizeProxyID(raw)
+}
+
+// SourceIPTransportURL converts a direct source IP binding into the internal transport URL form.
+func SourceIPTransportURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if ValidateSourceIP(trimmed) != nil {
+		return ""
+	}
+	return "sourceip://" + trimmed
 }

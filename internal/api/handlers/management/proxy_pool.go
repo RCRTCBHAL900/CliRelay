@@ -108,7 +108,10 @@ func (h *Handler) PostProxyPoolCheck(c *gin.Context) {
 	proxyURL := strings.TrimSpace(body.URL)
 	if proxyURL == "" && usage.ProxyPoolStoreAvailable() {
 		if entry := usage.GetProxyPoolEntry(body.ID); entry != nil && entry.Enabled {
-			proxyURL = strings.TrimSpace(entry.URL)
+			proxyURL = config.SourceIPTransportURL(entry.SourceIP)
+			if proxyURL == "" {
+				proxyURL = strings.TrimSpace(entry.URL)
+			}
 		}
 	}
 	if proxyURL == "" && h != nil && h.cfg != nil {

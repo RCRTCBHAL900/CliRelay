@@ -117,3 +117,28 @@ func TestNewProxyAwareHTTPClientHonorsPreferIPv4ForHTTPProxy(t *testing.T) {
 		t.Fatalf("proxy hits = %d, want 0 when preferIPv4 blocks IPv6-only proxy", proxyHits)
 	}
 }
+
+func TestNewProxyAwareHTTPClientSupportsSourceIPPoolBinding(t *testing.T) {
+	t.Parallel()
+
+	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer targetServer.Close()
+
+	cfg := &config.Config{
+		ProxyPool: []config.ProxyPoolEntry{
+			{ID: "direct", Name: "Direct", SourceIP: "127.0.0.1", Enabled: true},
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		ProxyID: "direct",
+	}
+	client := newProxyAwareHTTPClient(context.Background(), cfg, auth, 0)
+
+	resp, err := client.Get(targetServer.URL)
+	if err != nil {
+		t.Fatalf("client.Get returned error: %v", err)
+	}
+	_ = resp.Body.Close()
+}
