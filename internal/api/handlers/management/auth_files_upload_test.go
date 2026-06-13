@@ -284,7 +284,7 @@ func TestListAuthFilesSupportsProviderSearchAndPagination(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest(http.MethodGet, "/auth-files?provider=claude&search=beta&limit=1&offset=0", nil)
+	c.Request = httptest.NewRequest(http.MethodGet, "/auth-files?provider=claude&search=beta&limit=1&offset=0&include_counts=1&include_names=1", nil)
 
 	h.ListAuthFiles(c)
 
@@ -293,21 +293,38 @@ func TestListAuthFilesSupportsProviderSearchAndPagination(t *testing.T) {
 	}
 
 	var payload struct {
-		Files    []map[string]any `json:"files"`
-		Total    int              `json:"total"`
-		Offset   int              `json:"offset"`
-		Limit    int              `json:"limit"`
-		Returned int              `json:"returned"`
-		HasMore  bool             `json:"has_more"`
+		Files        []map[string]any `json:"files"`
+		Total        int              `json:"total"`
+		Offset       int              `json:"offset"`
+		Limit        int              `json:"limit"`
+		Returned     int              `json:"returned"`
+		HasMore      bool             `json:"has_more"`
+		Page         int              `json:"page"`
+		TotalPages   int              `json:"total_pages"`
+		FilterCounts struct {
+			Total  int            `json:"total"`
+			Counts map[string]int `json:"counts"`
+		} `json:"filter_counts"`
+		ProviderOptions []string `json:"provider_options"`
+		SelectableNames []string `json:"selectable_names"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("Unmarshal response: %v", err)
 	}
-	if payload.Total != 1 || payload.Returned != 1 || payload.Offset != 0 || payload.Limit != 1 || payload.HasMore {
+	if payload.Total != 1 || payload.Returned != 1 || payload.Offset != 0 || payload.Limit != 1 || payload.HasMore || payload.Page != 1 || payload.TotalPages != 1 {
 		t.Fatalf("unexpected pagination payload: %#v", payload)
 	}
 	if len(payload.Files) != 1 || payload.Files[0]["name"] != "beta.json" {
 		t.Fatalf("files = %#v, want beta.json", payload.Files)
+	}
+	if payload.FilterCounts.Total != 1 || payload.FilterCounts.Counts["claude"] != 1 {
+		t.Fatalf("unexpected filter counts: %#v", payload.FilterCounts)
+	}
+	if len(payload.ProviderOptions) != 1 || payload.ProviderOptions[0] != "claude" {
+		t.Fatalf("provider options = %#v, want [claude]", payload.ProviderOptions)
+	}
+	if len(payload.SelectableNames) != 1 || payload.SelectableNames[0] != "beta.json" {
+		t.Fatalf("selectable names = %#v, want [beta.json]", payload.SelectableNames)
 	}
 }
 

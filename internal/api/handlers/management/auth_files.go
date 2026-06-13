@@ -545,22 +545,20 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
-	offset, limit, providerFilter, searchFilter, err := parseAuthFileListFilters(c)
+	offset, limit, providerFilter, searchFilter, includeCounts, includeNames, err := parseAuthFileListFilters(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	if h.authManager == nil {
-		h.listAuthFilesFromDisk(c, offset, limit, providerFilter, searchFilter)
+		h.listAuthFilesFromDisk(c, offset, limit, providerFilter, searchFilter, includeCounts, includeNames)
 		return
 	}
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
-			if authFileEntryMatches(entry, providerFilter, searchFilter) {
-				files = append(files, entry)
-			}
+			files = append(files, entry)
 		}
 	}
 	sort.Slice(files, func(i, j int) bool {
@@ -568,15 +566,9 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
-	pageFiles, total, returned, hasMore := paginateAuthFileEntries(files, offset, limit)
-	c.JSON(200, gin.H{
-		"files":    pageFiles,
-		"total":    total,
-		"offset":   offset,
-		"limit":    limit,
-		"returned": returned,
-		"has_more": hasMore,
-	})
+	searchFiltered := filterAuthFileEntries(files, "", searchFilter)
+	providerFiltered := filterAuthFileEntries(searchFiltered, providerFilter, "")
+	respondWithAuthFileList(c, searchFiltered, providerFiltered, offset, limit, includeCounts, includeNames)
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -628,7 +620,7 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 }
 
 // List auth files from disk when the auth manager is unavailable.
-func (h *Handler) listAuthFilesFromDisk(c *gin.Context, offset int, limit int, providerFilter string, searchFilter string) {
+func (h *Handler) listAuthFilesFromDisk(c *gin.Context, offset int, limit int, providerFilter string, searchFilter string, includeCounts bool, includeNames bool) {
 	entries, err := os.ReadDir(h.cfg.AuthDir)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
@@ -659,9 +651,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, offset int, limit int, p
 				}
 			}
 
-			if authFileEntryMatches(fileData, providerFilter, searchFilter) {
-				files = append(files, fileData)
-			}
+			files = append(files, fileData)
 		}
 	}
 	sort.Slice(files, func(i, j int) bool {
@@ -669,31 +659,25 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, offset int, limit int, p
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
-	pageFiles, total, returned, hasMore := paginateAuthFileEntries(files, offset, limit)
-	c.JSON(200, gin.H{
-		"files":    pageFiles,
-		"total":    total,
-		"offset":   offset,
-		"limit":    limit,
-		"returned": returned,
-		"has_more": hasMore,
-	})
+	searchFiltered := filterAuthFileEntries(files, "", searchFilter)
+	providerFiltered := filterAuthFileEntries(searchFiltered, providerFilter, "")
+	respondWithAuthFileList(c, searchFiltered, providerFiltered, offset, limit, includeCounts, includeNames)
 }
 
-func parseAuthFileListFilters(c *gin.Context) (offset int, limit int, providerFilter string, searchFilter string, err error) {
+func parseAuthFileListFilters(c *gin.Context) (offset int, limit int, providerFilter string, searchFilter string, includeCounts bool, includeNames bool, err error) {
 	if c == nil {
-		return 0, 0, "", "", nil
+		return 0, 0, "", "", false, false, nil
 	}
 	if raw := strings.TrimSpace(c.Query("offset")); raw != "" {
 		offset, err = strconv.Atoi(raw)
 		if err != nil || offset < 0 {
-			return 0, 0, "", "", fmt.Errorf("offset must be a non-negative integer")
+			return 0, 0, "", "", false, false, fmt.Errorf("offset must be a non-negative integer")
 		}
 	}
 	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
 		limit, err = strconv.Atoi(raw)
 		if err != nil || limit < 0 {
-			return 0, 0, "", "", fmt.Errorf("limit must be a non-negative integer")
+			return 0, 0, "", "", false, false, fmt.Errorf("limit must be a non-negative integer")
 		}
 		if limit > 500 {
 			limit = 500
@@ -701,7 +685,9 @@ func parseAuthFileListFilters(c *gin.Context) (offset int, limit int, providerFi
 	}
 	providerFilter = strings.ToLower(strings.TrimSpace(c.Query("provider")))
 	searchFilter = strings.ToLower(strings.TrimSpace(c.Query("search")))
-	return offset, limit, providerFilter, searchFilter, nil
+	includeCounts = queryTruthy(c, "include_counts")
+	includeNames = queryTruthy(c, "include_names")
+	return offset, limit, providerFilter, searchFilter, includeCounts, includeNames, nil
 }
 
 func paginateAuthFileEntries(files []gin.H, offset int, limit int) ([]gin.H, int, int, bool) {
@@ -718,6 +704,10 @@ func paginateAuthFileEntries(files []gin.H, offset int, limit int) ([]gin.H, int
 }
 
 func authFileEntryMatches(entry gin.H, providerFilter string, searchFilter string) bool {
+	return authFileEntryMatchesProvider(entry, providerFilter) && authFileEntryMatchesSearch(entry, searchFilter)
+}
+
+func authFileEntryMatchesProvider(entry gin.H, providerFilter string) bool {
 	if len(entry) == 0 {
 		return false
 	}
@@ -728,6 +718,13 @@ func authFileEntryMatches(entry gin.H, providerFilter string, searchFilter strin
 			return false
 		}
 	}
+	return true
+}
+
+func authFileEntryMatchesSearch(entry gin.H, searchFilter string) bool {
+	if len(entry) == 0 {
+		return false
+	}
 	if searchFilter == "" {
 		return true
 	}
@@ -737,6 +734,121 @@ func authFileEntryMatches(entry gin.H, providerFilter string, searchFilter strin
 		}
 	}
 	return false
+}
+
+func filterAuthFileEntries(entries []gin.H, providerFilter string, searchFilter string) []gin.H {
+	if len(entries) == 0 {
+		return []gin.H{}
+	}
+	filtered := make([]gin.H, 0, len(entries))
+	for _, entry := range entries {
+		if authFileEntryMatches(entry, providerFilter, searchFilter) {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+func buildAuthFileFilterCounts(entries []gin.H) gin.H {
+	counts := make(map[string]int)
+	for _, entry := range entries {
+		provider := strings.ToLower(strings.TrimSpace(stringFromAny(entry["provider"])))
+		if provider == "" {
+			provider = strings.ToLower(strings.TrimSpace(stringFromAny(entry["type"])))
+		}
+		if provider == "" || provider == "all" {
+			continue
+		}
+		counts[provider]++
+	}
+	return gin.H{
+		"total":  len(entries),
+		"counts": counts,
+	}
+}
+
+func buildAuthFileProviderOptions(entries []gin.H) []string {
+	seen := make(map[string]struct{})
+	providers := make([]string, 0)
+	for _, entry := range entries {
+		provider := strings.ToLower(strings.TrimSpace(stringFromAny(entry["provider"])))
+		if provider == "" {
+			provider = strings.ToLower(strings.TrimSpace(stringFromAny(entry["type"])))
+		}
+		if provider == "" || provider == "all" {
+			continue
+		}
+		if _, ok := seen[provider]; ok {
+			continue
+		}
+		seen[provider] = struct{}{}
+		providers = append(providers, provider)
+	}
+	sort.Strings(providers)
+	return providers
+}
+
+func buildSelectableAuthFileNames(entries []gin.H) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if runtimeOnly, _ := entry["runtime_only"].(bool); runtimeOnly {
+			continue
+		}
+		name := strings.TrimSpace(stringFromAny(entry["name"]))
+		if name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func respondWithAuthFileList(c *gin.Context, searchFiltered []gin.H, providerFiltered []gin.H, offset int, limit int, includeCounts bool, includeNames bool) {
+	pageFiles, total, returned, hasMore := paginateAuthFileEntries(providerFiltered, offset, limit)
+	totalPages := 1
+	page := 1
+	if limit > 0 {
+		totalPages = (total + limit - 1) / limit
+		if totalPages < 1 {
+			totalPages = 1
+		}
+		page = offset/limit + 1
+		if page > totalPages {
+			page = totalPages
+		}
+	}
+	payload := gin.H{
+		"files":       pageFiles,
+		"total":       total,
+		"offset":      offset,
+		"limit":       limit,
+		"returned":    returned,
+		"has_more":    hasMore,
+		"page":        page,
+		"total_pages": totalPages,
+	}
+	if includeCounts {
+		payload["filter_counts"] = buildAuthFileFilterCounts(searchFiltered)
+		payload["provider_options"] = buildAuthFileProviderOptions(searchFiltered)
+	}
+	if includeNames {
+		payload["selectable_names"] = buildSelectableAuthFileNames(providerFiltered)
+	}
+	c.JSON(http.StatusOK, payload)
+}
+
+func queryTruthy(c *gin.Context, key string) bool {
+	if c == nil {
+		return false
+	}
+	raw := strings.TrimSpace(strings.ToLower(c.Query(key)))
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func stringFromAny(value any) string {

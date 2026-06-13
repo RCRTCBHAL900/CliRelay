@@ -195,3 +195,43 @@ func TestManagementAssetsDoNotMixBareAndCacheBustedAppModules(t *testing.T) {
 		}
 	}
 }
+
+func TestAuthFilesServiceUsesPagedListParams(t *testing.T) {
+	_, content := readManagementAssetByPrefix(t, "auth-files")
+	content = normalizeAssetContent(content)
+
+	for _, want := range []string{
+		`list:(e={})=>a.get("/auth-files",{params:e})`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("auth-files service missing paged list marker %q", want)
+		}
+	}
+}
+
+func TestAuthFilesPageUsesServerPagedAuthListing(t *testing.T) {
+	_, content := readActiveAuthFilesAsset(t)
+	content = normalizeAssetContent(content)
+
+	for _, want := range []string{
+		`include_counts:1`,
+		`include_names:1`,
+		`provider_options`,
+		`filter_counts`,
+		`selectable_names`,
+		`serverPaged:!0`,
+		`zn2({filter:`,
+		`serverPageInfo:`,
+		`filesLength:`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("auth files page missing server-paged marker %q", want)
+		}
+	}
+}
+
+var assetWhitespace = regexp.MustCompile(`\s+`)
+
+func normalizeAssetContent(content string) string {
+	return assetWhitespace.ReplaceAllString(content, "")
+}
