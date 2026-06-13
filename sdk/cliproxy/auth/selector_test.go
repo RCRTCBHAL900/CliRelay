@@ -397,6 +397,50 @@ func TestRoundRobinSelectorPick_Concurrent(t *testing.T) {
 	}
 }
 
+func TestRoundRobinSelectorPick_ClaudePrefersLeastBusyAuth(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	auths := []*Auth{
+		{ID: "busy", Provider: "claude", CurrentInFlight: 1},
+		{ID: "idle-a", Provider: "claude", CurrentInFlight: 0},
+		{ID: "idle-b", Provider: "claude", CurrentInFlight: 0},
+	}
+
+	want := []string{"idle-a", "idle-b", "idle-a", "idle-b"}
+	for i, id := range want {
+		got, err := selector.Pick(context.Background(), "claude", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() #%d auth = nil", i)
+		}
+		if got.ID != id {
+			t.Fatalf("Pick() #%d auth.ID = %q, want %q", i, got.ID, id)
+		}
+	}
+}
+
+func TestRoundRobinSelectorPick_ClaudeSaturatedReturnsCooldown(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	auths := []*Auth{
+		{ID: "a", Provider: "claude", CurrentInFlight: 2},
+		{ID: "b", Provider: "claude", CurrentInFlight: 2},
+	}
+
+	_, err := selector.Pick(context.Background(), "claude", "claude-opus", cliproxyexecutor.Options{}, auths)
+	if err == nil {
+		t.Fatal("Pick() error = nil, want cooldown error")
+	}
+	var cooldownErr *modelCooldownError
+	if !errors.As(err, &cooldownErr) {
+		t.Fatalf("Pick() error = %T, want *modelCooldownError", err)
+	}
+}
+
 func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 	t.Parallel()
 

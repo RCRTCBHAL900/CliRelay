@@ -90,6 +90,12 @@ type Auth struct {
 	NextRetryAfter time.Time `json:"next_retry_after"`
 	// ModelStates tracks per-model runtime availability data.
 	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
+	// CurrentInFlight tracks live request leases for load-aware schedulers.
+	CurrentInFlight int `json:"-"`
+	// ConsecutiveFailures tracks repeated auth-level failures with the same status.
+	ConsecutiveFailures int `json:"-"`
+	// LastFailureStatus records the last auth-level HTTP-like failure status.
+	LastFailureStatus int `json:"-"`
 
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
@@ -125,6 +131,10 @@ type ModelState struct {
 	Quota QuotaState `json:"quota"`
 	// UpdatedAt tracks the last update timestamp for this model state.
 	UpdatedAt time.Time `json:"updated_at"`
+	// ConsecutiveFailures tracks repeated model-level failures with the same status.
+	ConsecutiveFailures int `json:"-"`
+	// LastFailureStatus records the last model-level HTTP-like failure status.
+	LastFailureStatus int `json:"-"`
 }
 
 // Clone shallow copies the Auth structure, duplicating maps to avoid accidental mutation.

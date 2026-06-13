@@ -29,6 +29,9 @@ func TestGenerateAuthURLWithRedirectURIUsesProvidedRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse auth URL: %v", err)
 	}
+	if got := parsed.Scheme + "://" + parsed.Host + parsed.Path; got != AuthURL {
+		t.Fatalf("auth url = %q, want %q", got, AuthURL)
+	}
 	if got := parsed.Query().Get("redirect_uri"); got != PlatformRedirectURI {
 		t.Fatalf("redirect_uri = %q, want %q", got, PlatformRedirectURI)
 	}

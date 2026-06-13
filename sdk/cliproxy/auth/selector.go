@@ -56,6 +56,12 @@ type modelUnavailableError struct {
 	provider string
 }
 
+const (
+	defaultLoadBusyRetryAfter  = time.Second
+	defaultClaudeMaxInFlight   = 2
+	defaultClaudeMinQueueFloor = 0
+)
+
 func newModelCooldownError(model, provider string, resetIn time.Duration) *modelCooldownError {
 	if resetIn < 0 {
 		resetIn = 0
@@ -463,6 +469,177 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time, inc
 	return available, nil
 }
 
+func loadAwareSelectionEnabled(available []*Auth) bool {
+	if len(available) == 0 {
+		return false
+	}
+	enabled := false
+	for _, auth := range available {
+		if auth == nil {
+			return false
+		}
+		if !authLoadAwareSchedulingEnabled(auth) {
+			return false
+		}
+		enabled = true
+	}
+	return enabled
+}
+
+func authLoadAwareSchedulingEnabled(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if val, ok := authBoolSetting(auth, "load_aware_scheduler", "load-aware-scheduler"); ok {
+		return val
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Provider), "claude")
+}
+
+func authMaxInFlight(auth *Auth) int {
+	if auth == nil {
+		return 0
+	}
+	if val, ok := authIntSetting(auth, "scheduler_max_inflight", "scheduler-max-inflight", "max_inflight", "max-inflight", "max_in_flight", "concurrency_limit", "concurrency-limit"); ok {
+		if val < 0 {
+			return 0
+		}
+		return val
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+		return defaultClaudeMaxInFlight
+	}
+	return 0
+}
+
+func authIntSetting(auth *Auth, keys ...string) (int, bool) {
+	if auth == nil {
+		return 0, false
+	}
+	if auth.Attributes != nil {
+		for _, key := range keys {
+			raw := strings.TrimSpace(auth.Attributes[key])
+			if raw == "" {
+				continue
+			}
+			parsed, err := strconv.Atoi(raw)
+			if err == nil {
+				return parsed, true
+			}
+		}
+	}
+	if auth.Metadata != nil {
+		for _, key := range keys {
+			raw, ok := auth.Metadata[key]
+			if !ok || raw == nil {
+				continue
+			}
+			switch v := raw.(type) {
+			case int:
+				return v, true
+			case int32:
+				return int(v), true
+			case int64:
+				return int(v), true
+			case float32:
+				return int(v), true
+			case float64:
+				return int(v), true
+			case json.Number:
+				if parsed, err := v.Int64(); err == nil {
+					return int(parsed), true
+				}
+			case string:
+				parsed, err := strconv.Atoi(strings.TrimSpace(v))
+				if err == nil {
+					return parsed, true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+func authBoolSetting(auth *Auth, keys ...string) (bool, bool) {
+	if auth == nil {
+		return false, false
+	}
+	if auth.Attributes != nil {
+		for _, key := range keys {
+			raw := strings.TrimSpace(auth.Attributes[key])
+			if raw == "" {
+				continue
+			}
+			parsed, err := strconv.ParseBool(raw)
+			if err == nil {
+				return parsed, true
+			}
+		}
+	}
+	if auth.Metadata != nil {
+		for _, key := range keys {
+			raw, ok := auth.Metadata[key]
+			if !ok || raw == nil {
+				continue
+			}
+			switch v := raw.(type) {
+			case bool:
+				return v, true
+			case string:
+				parsed, err := strconv.ParseBool(strings.TrimSpace(v))
+				if err == nil {
+					return parsed, true
+				}
+			}
+		}
+	}
+	return false, false
+}
+
+func filterAvailableByCurrentLoad(available []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+	if len(available) == 0 || !loadAwareSelectionEnabled(available) {
+		return available, nil
+	}
+
+	minInFlight := math.MaxInt
+	filtered := make([]*Auth, 0, len(available))
+	unsaturated := 0
+	for _, auth := range available {
+		if auth == nil {
+			continue
+		}
+		limit := authMaxInFlight(auth)
+		if limit > 0 && auth.CurrentInFlight >= limit {
+			continue
+		}
+		unsaturated++
+		current := auth.CurrentInFlight
+		if current < defaultClaudeMinQueueFloor {
+			current = defaultClaudeMinQueueFloor
+		}
+		if current < minInFlight {
+			minInFlight = current
+			filtered = filtered[:0]
+			filtered = append(filtered, auth)
+			continue
+		}
+		if current == minInFlight {
+			filtered = append(filtered, auth)
+		}
+	}
+	if len(filtered) > 0 {
+		return filtered, nil
+	}
+	if unsaturated == 0 {
+		providerForError := provider
+		if providerForError == "mixed" {
+			providerForError = ""
+		}
+		return nil, newModelCooldownError(model, providerForError, defaultLoadBusyRetryAfter)
+	}
+	return available, nil
+}
+
 func ensureWeightedState(states map[string]*weightedCursorState, key string, limit int) map[string]*weightedCursorState {
 	if states == nil {
 		states = make(map[string]*weightedCursorState)
@@ -554,6 +731,10 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available, err = filterAvailableByCurrentLoad(available, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	if s.cursors == nil {
@@ -665,6 +846,10 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available, err = filterAvailableByCurrentLoad(available, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
 	return available[0], nil
 }
 

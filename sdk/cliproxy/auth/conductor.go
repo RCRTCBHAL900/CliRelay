@@ -66,6 +66,7 @@ const (
 	refreshFailureBackoff = 5 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
+	authFailureThreshold  = 3
 )
 
 // PermanentAuthError indicates an unrecoverable authentication failure.
@@ -523,6 +524,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.EnsureIndex()
 	snapshot := auth.Clone()
 	m.mu.Lock()
+	snapshot.CurrentInFlight = 0
+	snapshot.ConsecutiveFailures = 0
+	snapshot.LastFailureStatus = 0
 	m.auths[auth.ID] = snapshot
 	m.mu.Unlock()
 	if err := m.persist(ctx, snapshot); err != nil {
@@ -553,6 +557,11 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	auth.EnsureIndex()
 	snapshot := auth.Clone()
+	if previous != nil {
+		snapshot.CurrentInFlight = previous.CurrentInFlight
+		snapshot.ConsecutiveFailures = previous.ConsecutiveFailures
+		snapshot.LastFailureStatus = previous.LastFailureStatus
+	}
 	m.auths[auth.ID] = snapshot
 	m.mu.Unlock()
 	if err := m.persist(ctx, snapshot); err != nil {
@@ -588,6 +597,9 @@ func (m *Manager) Load(ctx context.Context) error {
 			continue
 		}
 		auth.EnsureIndex()
+		auth.CurrentInFlight = 0
+		auth.ConsecutiveFailures = 0
+		auth.LastFailureStatus = 0
 		m.auths[auth.ID] = auth.Clone()
 	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
@@ -714,6 +726,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
+		released := false
+		releaseAuth := func() {
+			if released {
+				return
+			}
+			released = true
+			m.releaseAuthLease(auth.ID)
+		}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -726,6 +746,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
 		result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
 		if errExec != nil {
+			releaseAuth()
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, errCtx
 			}
@@ -746,6 +767,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			lastErr = errExec
 			continue
 		}
+		releaseAuth()
 		m.MarkResult(execCtx, result)
 		return resp, nil
 	}
@@ -774,6 +796,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
+		released := false
+		releaseAuth := func() {
+			if released {
+				return
+			}
+			released = true
+			m.releaseAuthLease(auth.ID)
+		}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -785,6 +815,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		execReq.Model = m.applyAPIKeyModelAlias(auth, execReq.Model)
 		resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
 		if errExec != nil {
+			releaseAuth()
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, errCtx
 			}
@@ -797,6 +828,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			lastErr = errExec
 			continue
 		}
+		releaseAuth()
 		return resp, nil
 	}
 }
@@ -824,6 +856,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
+		released := false
+		releaseAuth := func() {
+			if released {
+				return
+			}
+			released = true
+			m.releaseAuthLease(auth.ID)
+		}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -835,6 +875,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		execReq.Model = m.applyAPIKeyModelAlias(auth, execReq.Model)
 		streamResult, errStream := executor.ExecuteStream(execCtx, auth, execReq, opts)
 		if errStream != nil {
+			releaseAuth()
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
@@ -856,6 +897,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		out := make(chan cliproxyexecutor.StreamChunk)
 		go func(streamCtx context.Context, streamAuth *Auth, streamProvider string, streamChunks <-chan cliproxyexecutor.StreamChunk) {
+			defer releaseAuth()
 			defer close(out)
 			var failed bool
 			forward := true
@@ -1480,6 +1522,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				}
 
 				statusCode := statusCodeFromResult(result.Error)
+				state.ConsecutiveFailures = nextConsecutiveFailureCount(state.LastFailureStatus, statusCode, state.ConsecutiveFailures)
+				state.LastFailureStatus = statusCode
 				switch statusCode {
 				case 401:
 					next := now.Add(30 * time.Minute)
@@ -1527,6 +1571,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					}
 				default:
 					state.NextRetryAfter = time.Time{}
+				}
+				if escalated := failureEscalationCooldown(result.Provider, statusCode, state.ConsecutiveFailures, result.RetryAfter); escalated > 0 {
+					next := now.Add(escalated)
+					if state.NextRetryAfter.IsZero() || next.After(state.NextRetryAfter) {
+						state.NextRetryAfter = next
+					}
+					if state.Quota.Exceeded && (state.Quota.NextRecoverAt.IsZero() || next.After(state.Quota.NextRecoverAt)) {
+						state.Quota.NextRecoverAt = next
+					}
+					shouldSuspendModel = true
 				}
 
 				auth.Status = StatusError
@@ -1582,6 +1636,8 @@ func resetModelState(state *ModelState, now time.Time) {
 	state.LastError = nil
 	state.Quota = QuotaState{}
 	state.UpdatedAt = now
+	state.ConsecutiveFailures = 0
+	state.LastFailureStatus = 0
 }
 
 func updateAggregatedAvailability(auth *Auth, now time.Time) {
@@ -1679,6 +1735,8 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	auth.LastError = nil
 	auth.NextRetryAfter = time.Time{}
 	auth.UpdatedAt = now
+	auth.ConsecutiveFailures = 0
+	auth.LastFailureStatus = 0
 }
 
 func cloneError(err *Error) *Error {
@@ -1836,6 +1894,8 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 	}
 	statusCode := statusCodeFromResult(resultErr)
+	auth.ConsecutiveFailures = nextConsecutiveFailureCount(auth.LastFailureStatus, statusCode, auth.ConsecutiveFailures)
+	auth.LastFailureStatus = statusCode
 	switch statusCode {
 	case 401:
 		auth.StatusMessage = "unauthorized"
@@ -1874,6 +1934,61 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.StatusMessage = "request failed"
 		}
 	}
+	if escalated := failureEscalationCooldown(auth.Provider, statusCode, auth.ConsecutiveFailures, retryAfter); escalated > 0 {
+		next := now.Add(escalated)
+		if auth.NextRetryAfter.IsZero() || next.After(auth.NextRetryAfter) {
+			auth.NextRetryAfter = next
+		}
+		if auth.Quota.Exceeded && (auth.Quota.NextRecoverAt.IsZero() || next.After(auth.Quota.NextRecoverAt)) {
+			auth.Quota.NextRecoverAt = next
+		}
+	}
+}
+
+func nextConsecutiveFailureCount(previousStatus, status, previousCount int) int {
+	if status <= 0 {
+		return 0
+	}
+	if previousStatus == status && previousCount > 0 {
+		return previousCount + 1
+	}
+	return 1
+}
+
+func failureEscalationCooldown(provider string, statusCode, failures int, retryAfter *time.Duration) time.Duration {
+	if !strings.EqualFold(strings.TrimSpace(provider), "claude") || statusCode <= 0 {
+		return 0
+	}
+	switch statusCode {
+	case 401, 402, 403:
+		if failures >= 2 {
+			return 6 * time.Hour
+		}
+	case 429:
+		if failures >= 2 {
+			base := 15 * time.Minute
+			if retryAfter != nil && *retryAfter > base {
+				return *retryAfter
+			}
+			if failures >= 4 {
+				return 30 * time.Minute
+			}
+			return base
+		}
+	case 408, 500, 502, 503, 504:
+		if failures >= authFailureThreshold {
+			step := failures - authFailureThreshold
+			if step < 0 {
+				step = 0
+			}
+			cooldown := 5 * time.Minute * time.Duration(1<<step)
+			if cooldown > 30*time.Minute {
+				cooldown = 30 * time.Minute
+			}
+			return cooldown
+		}
+	}
+	return 0
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
@@ -2066,14 +2181,15 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	}
 	authCopy := selected.Clone()
 	m.mu.RUnlock()
-	if !selected.indexAssigned {
-		m.mu.Lock()
-		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+	m.mu.Lock()
+	if current := m.auths[authCopy.ID]; current != nil {
+		current.CurrentInFlight++
+		if !current.indexAssigned {
 			current.EnsureIndex()
-			authCopy = current.Clone()
 		}
-		m.mu.Unlock()
+		authCopy = current.Clone()
 	}
+	m.mu.Unlock()
 	return authCopy, executor, nil
 }
 
@@ -2175,14 +2291,15 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 	authCopy := selected.Clone()
 	m.mu.RUnlock()
-	if !selected.indexAssigned {
-		m.mu.Lock()
-		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+	m.mu.Lock()
+	if current := m.auths[authCopy.ID]; current != nil {
+		current.CurrentInFlight++
+		if !current.indexAssigned {
 			current.EnsureIndex()
-			authCopy = current.Clone()
 		}
-		m.mu.Unlock()
+		authCopy = current.Clone()
 	}
+	m.mu.Unlock()
 	return authCopy, executor, providerKey, nil
 }
 
@@ -2570,6 +2687,25 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.LastError = nil
 	updated.UpdatedAt = now
 	_, _ = m.Update(ctx, updated)
+}
+
+func (m *Manager) releaseAuthLease(authID string) {
+	if m == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	auth := m.auths[authID]
+	if auth == nil {
+		return
+	}
+	if auth.CurrentInFlight > 0 {
+		auth.CurrentInFlight--
+	}
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
