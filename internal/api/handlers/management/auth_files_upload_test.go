@@ -213,6 +213,47 @@ func TestRegisterAuthFromFileAutoAssignsClaudeSourceIPLane(t *testing.T) {
 	}
 }
 
+func TestRegisterAuthFromFileFallsBackToObservedClaudeLanes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := &Handler{
+		cfg: &config.Config{
+			AuthDir: authDir,
+		},
+		authManager: manager,
+	}
+
+	existingPath := filepath.Join(authDir, "existing.json")
+	if err := os.WriteFile(existingPath, []byte(`{"type":"claude","email":"existing@example.com","proxy_url":"sourceip://152.89.86.108","proxy_id":"lane-a"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile existing: %v", err)
+	}
+	if err := h.registerAuthFromFile(context.Background(), existingPath, nil); err != nil {
+		t.Fatalf("register existing auth: %v", err)
+	}
+
+	newPath := filepath.Join(authDir, "new.json")
+	if err := os.WriteFile(newPath, []byte(`{"type":"claude","email":"new@example.com"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile new: %v", err)
+	}
+	if err := h.registerAuthFromFile(context.Background(), newPath, nil); err != nil {
+		t.Fatalf("register new auth: %v", err)
+	}
+
+	auth, ok := manager.GetByID("new.json")
+	if !ok || auth == nil {
+		t.Fatalf("registered auth not found")
+	}
+	if auth.ProxyURL != "sourceip://152.89.86.108" {
+		t.Fatalf("ProxyURL = %q, want sourceip://152.89.86.108", auth.ProxyURL)
+	}
+	if auth.ProxyID != "lane-a" {
+		t.Fatalf("ProxyID = %q, want lane-a", auth.ProxyID)
+	}
+}
+
 func TestListAuthFilesSupportsProviderSearchAndPagination(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

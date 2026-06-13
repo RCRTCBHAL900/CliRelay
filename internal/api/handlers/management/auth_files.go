@@ -1475,6 +1475,9 @@ func (h *Handler) prepareManagedAuthFile(path string, data []byte) ([]byte, map[
 func (h *Handler) selectAutomaticProxyEntry(provider string, authID string) *config.ProxyPoolEntry {
 	entries := h.listEnabledProxyPoolEntries()
 	if len(entries) == 0 {
+		entries = h.listObservedProxyEntries(provider, authID)
+	}
+	if len(entries) == 0 {
 		return nil
 	}
 	assignments := make(map[string]int, len(entries))
@@ -1537,6 +1540,36 @@ func (h *Handler) listEnabledProxyPoolEntries() []config.ProxyPoolEntry {
 	return out
 }
 
+func (h *Handler) listObservedProxyEntries(provider string, authID string) []config.ProxyPoolEntry {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	out := make([]config.ProxyPoolEntry, 0)
+	for _, auth := range h.authManager.List() {
+		if auth == nil || auth.ID == authID {
+			continue
+		}
+		if provider != "" && !strings.EqualFold(strings.TrimSpace(auth.Provider), provider) {
+			continue
+		}
+		entry, ok := observedProxyEntryFromAuth(auth)
+		if !ok {
+			continue
+		}
+		key := proxyPoolAssignmentKey(entry)
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, entry)
+	}
+	return out
+}
+
 func normalizeProxyPoolSelectionID(raw string) string {
 	trimmed := strings.ToLower(strings.TrimSpace(raw))
 	if trimmed == "" {
@@ -1586,6 +1619,49 @@ func resolveAutomaticProxyURL(entry config.ProxyPoolEntry) string {
 		return config.SourceIPTransportURL(sourceIP)
 	}
 	return strings.TrimSpace(entry.URL)
+}
+
+func observedProxyEntryFromAuth(auth *coreauth.Auth) (config.ProxyPoolEntry, bool) {
+	if auth == nil {
+		return config.ProxyPoolEntry{}, false
+	}
+	if sourceIP, ok := sourceIPFromProxyURL(auth.ProxyURL); ok {
+		id := strings.TrimSpace(auth.ProxyID)
+		if id == "" {
+			id = "source-ip-" + normalizeProxyPoolSelectionID(sourceIP)
+		}
+		return config.ProxyPoolEntry{
+			ID:       id,
+			Name:     id,
+			SourceIP: sourceIP,
+			Enabled:  true,
+		}, true
+	}
+	if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+		id := strings.TrimSpace(auth.ProxyID)
+		if id == "" {
+			id = "proxy-" + normalizeProxyPoolSelectionID(proxyURL)
+		}
+		return config.ProxyPoolEntry{
+			ID:      id,
+			Name:    id,
+			URL:     proxyURL,
+			Enabled: true,
+		}, true
+	}
+	return config.ProxyPoolEntry{}, false
+}
+
+func sourceIPFromProxyURL(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if !strings.HasPrefix(trimmed, "sourceip://") {
+		return "", false
+	}
+	sourceIP := strings.TrimSpace(strings.TrimPrefix(trimmed, "sourceip://"))
+	if config.ValidateSourceIP(sourceIP) != nil {
+		return "", false
+	}
+	return sourceIP, true
 }
 
 // PatchAuthFileStatus toggles the disabled state of an auth file
