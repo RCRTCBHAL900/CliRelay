@@ -2,8 +2,13 @@ package handlers
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +17,7 @@ import (
 	internalrouting "github.com/router-for-me/CLIProxyAPI/v6/internal/routing"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
@@ -216,4 +222,107 @@ func TestRequestExecutionMetadata_UsesGinRequestContextPathRouteAfterHandleConte
 	if got := meta["route_fallback"]; got != "none" {
 		t.Fatalf("route_fallback = %v, want %q", got, "none")
 	}
+}
+
+func TestRequestExecutionMetadata_TrustedClaudeProxySecretAddsAffinity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const secret = "relay-secret"
+	t.Setenv("CLAUDE_UPSTREAM_PROXY_SECRET", secret)
+	t.Setenv("CLAUDE_PROXY_SECRET", "")
+
+	req := httptest.NewRequest("POST", "/anthropic/v1/messages", nil)
+	req.Header.Set(theClawBaySignedUserIDHeader, "user-1")
+	req.Header.Set(theClawBaySignedAPIKeyIDHeader, "key-1")
+	req.Header.Set(claudeProxySecretHeader, secret)
+
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = req
+
+	ctx := context.WithValue(context.Background(), util.ContextKeyGin, ginCtx)
+	meta := requestExecutionMetadata(ctx)
+	if got := meta[coreexecutor.AuthAffinityMetadataKey]; got != "tcb:user-1:key-1" {
+		t.Fatalf("auth_affinity_key = %v, want %q", got, "tcb:user-1:key-1")
+	}
+}
+
+func TestRequestExecutionMetadata_ValidGatewaySignatureAddsAffinity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const signingSecret = "signing-secret"
+	t.Setenv("CLAUDE_UPSTREAM_PROXY_SECRET", "")
+	t.Setenv("CLAUDE_PROXY_SECRET", "")
+	t.Setenv("CODEX_LB_PROXY_SIGNING_SECRET", signingSecret)
+
+	req := httptest.NewRequest("POST", "/anthropic/v1/messages?beta=true", nil)
+	req.Header.Set(theClawBaySignedUserIDHeader, "user-2")
+	req.Header.Set(theClawBaySignedAPIKeyIDHeader, "key-2")
+	req.Header.Set(theClawBaySignedPlanMultiplierHeader, "3")
+	signedAt := time.Now().UTC().Format(time.RFC3339)
+	nonce := "abcdef0123456789"
+	req.Header.Set(theClawBaySignedAtHeader, signedAt)
+	req.Header.Set(theClawBaySignedNonceHeader, nonce)
+	req.Header.Set(
+		theClawBaySignatureHeader,
+		signGatewayRequestForTest(req, signingSecret, "user-2", "key-2", "3", signedAt, nonce),
+	)
+
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = req
+
+	ctx := context.WithValue(context.Background(), util.ContextKeyGin, ginCtx)
+	meta := requestExecutionMetadata(ctx)
+	if got := meta[coreexecutor.AuthAffinityMetadataKey]; got != "tcb:user-2:key-2" {
+		t.Fatalf("auth_affinity_key = %v, want %q", got, "tcb:user-2:key-2")
+	}
+}
+
+func TestRequestExecutionMetadata_InvalidGatewaySignatureDoesNotAddAffinity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Setenv("CLAUDE_UPSTREAM_PROXY_SECRET", "")
+	t.Setenv("CLAUDE_PROXY_SECRET", "")
+	t.Setenv("CODEX_LB_PROXY_SIGNING_SECRET", "signing-secret")
+
+	req := httptest.NewRequest("POST", "/anthropic/v1/messages", nil)
+	req.Header.Set(theClawBaySignedUserIDHeader, "user-3")
+	req.Header.Set(theClawBaySignedAPIKeyIDHeader, "key-3")
+	req.Header.Set(theClawBaySignedPlanMultiplierHeader, "1")
+	req.Header.Set(theClawBaySignedAtHeader, time.Now().UTC().Format(time.RFC3339))
+	req.Header.Set(theClawBaySignedNonceHeader, "nonce")
+	req.Header.Set(theClawBaySignatureHeader, "bad-signature")
+
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = req
+
+	ctx := context.WithValue(context.Background(), util.ContextKeyGin, ginCtx)
+	meta := requestExecutionMetadata(ctx)
+	if _, exists := meta[coreexecutor.AuthAffinityMetadataKey]; exists {
+		t.Fatalf("unexpected affinity key in metadata: %v", meta)
+	}
+}
+
+func signGatewayRequestForTest(
+	req *http.Request,
+	secret string,
+	userID string,
+	apiKeyID string,
+	planMultiplier string,
+	signedAt string,
+	nonce string,
+) string {
+	pathWithSearch := req.URL.RequestURI()
+	payload := fmt.Sprintf(
+		"%s\n%s\n%s\n%s\n%s\n%s\n%s",
+		strings.ToUpper(req.Method),
+		pathWithSearch,
+		userID,
+		apiKeyID,
+		planMultiplier,
+		signedAt,
+		nonce,
+	)
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(payload))
+	return fmt.Sprintf("%x", mac.Sum(nil))
 }

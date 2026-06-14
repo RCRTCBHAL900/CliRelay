@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -438,6 +439,156 @@ func TestRoundRobinSelectorPick_ClaudeSaturatedReturnsCooldown(t *testing.T) {
 	var cooldownErr *modelCooldownError
 	if !errors.As(err, &cooldownErr) {
 		t.Fatalf("Pick() error = %T, want *modelCooldownError", err)
+	}
+}
+
+func TestRoundRobinSelectorPick_ClaudeAffinitySticksToSameAuth(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	auths := []*Auth{
+		{ID: "a", Provider: "claude"},
+		{ID: "b", Provider: "claude"},
+		{ID: "c", Provider: "claude"},
+	}
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.AuthAffinityMetadataKey: "tcb:user-1:key-1"},
+	}
+
+	first, err := selector.Pick(context.Background(), "claude", "claude-opus-4-8", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() first error = %v", err)
+	}
+	if first == nil {
+		t.Fatal("Pick() first auth = nil")
+	}
+
+	for i := 0; i < 8; i++ {
+		got, err := selector.Pick(context.Background(), "claude", "claude-opus-4-8", opts, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() #%d auth = nil", i)
+		}
+		if got.ID != first.ID {
+			t.Fatalf("Pick() #%d auth.ID = %q, want sticky %q", i, got.ID, first.ID)
+		}
+	}
+}
+
+func TestRoundRobinSelectorPick_ClaudeAffinityIgnoresMinorLoadDriftUntilSaturated(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	auths := []*Auth{
+		{ID: "a", Provider: "claude", CurrentInFlight: 0},
+		{ID: "b", Provider: "claude", CurrentInFlight: 1},
+	}
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.AuthAffinityMetadataKey: "tcb:user-2:key-1"},
+	}
+
+	first, err := selector.Pick(context.Background(), "claude", "claude-opus-4-8", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() first error = %v", err)
+	}
+	if first == nil {
+		t.Fatal("Pick() first auth = nil")
+	}
+
+	for _, auth := range auths {
+		if auth.ID == first.ID {
+			auth.CurrentInFlight = 1
+		}
+	}
+
+	got, err := selector.Pick(context.Background(), "claude", "claude-opus-4-8", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() second error = %v", err)
+	}
+	if got == nil {
+		t.Fatal("Pick() second auth = nil")
+	}
+	if got.ID != first.ID {
+		t.Fatalf("Pick() second auth.ID = %q, want sticky %q", got.ID, first.ID)
+	}
+}
+
+func TestRoundRobinSelectorPick_ClaudeAffinityFailsOverWhenSelectedAuthIsSaturated(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	auths := []*Auth{
+		{ID: "a", Provider: "claude"},
+		{ID: "b", Provider: "claude"},
+		{ID: "c", Provider: "claude"},
+	}
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.AuthAffinityMetadataKey: "tcb:user-3:key-1"},
+	}
+
+	first, err := selector.Pick(context.Background(), "claude", "claude-opus-4-8", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() first error = %v", err)
+	}
+	if first == nil {
+		t.Fatal("Pick() first auth = nil")
+	}
+	first.CurrentInFlight = 2
+
+	failover, err := selector.Pick(context.Background(), "claude", "claude-opus-4-8", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() failover error = %v", err)
+	}
+	if failover == nil {
+		t.Fatal("Pick() failover auth = nil")
+	}
+	if failover.ID == first.ID {
+		t.Fatalf("Pick() failover auth.ID = %q, want different auth after saturation", failover.ID)
+	}
+
+	first.CurrentInFlight = 0
+	recovered, err := selector.Pick(context.Background(), "claude", "claude-opus-4-8", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() recovered error = %v", err)
+	}
+	if recovered == nil {
+		t.Fatal("Pick() recovered auth = nil")
+	}
+	if recovered.ID != first.ID {
+		t.Fatalf("Pick() recovered auth.ID = %q, want original sticky %q", recovered.ID, first.ID)
+	}
+}
+
+func TestRoundRobinSelectorPick_ClaudeAffinityDistributesAcrossPool(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	auths := []*Auth{
+		{ID: "a", Provider: "claude"},
+		{ID: "b", Provider: "claude"},
+		{ID: "c", Provider: "claude"},
+	}
+
+	seen := make(map[string]struct{})
+	for i := 0; i < 32; i++ {
+		opts := cliproxyexecutor.Options{
+			Metadata: map[string]any{
+				cliproxyexecutor.AuthAffinityMetadataKey: "tcb:user-" + strconv.Itoa(i) + ":key-1",
+			},
+		}
+		got, err := selector.Pick(context.Background(), "claude", "claude-opus-4-8", opts, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() #%d auth = nil", i)
+		}
+		seen[got.ID] = struct{}{}
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected affinity distribution across pool, got %v", seen)
 	}
 }
 
