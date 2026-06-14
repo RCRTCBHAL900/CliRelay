@@ -13,6 +13,9 @@ const RequestedModelMetadataKey = "requested_model"
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
+	// AuthAffinityMetadataKey carries a stable downstream affinity seed used by
+	// schedulers that should keep the same caller on the same healthy auth.
+	AuthAffinityMetadataKey = "auth_affinity_key"
 	// SinglePickMetadataKey forces the auth manager to use exactly one picked auth
 	// for the request and return its error directly without internal retry/fallback.
 	SinglePickMetadataKey = "single_pick"

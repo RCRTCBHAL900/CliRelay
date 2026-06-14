@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -611,6 +613,24 @@ func authBoolSetting(auth *Auth, keys ...string) (bool, bool) {
 	return false, false
 }
 
+func authSelectionAffinity(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	raw, ok := meta[cliproxyexecutor.AuthAffinityMetadataKey]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []byte:
+		return strings.TrimSpace(string(v))
+	default:
+		return ""
+	}
+}
+
 func filterAvailableByCurrentLoad(available []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
 	if len(available) == 0 || !loadAwareSelectionEnabled(available) {
 		return available, nil
@@ -653,6 +673,33 @@ func filterAvailableByCurrentLoad(available []*Auth, provider, model string, now
 		return nil, newModelCooldownError(model, providerForError, defaultLoadBusyRetryAfter)
 	}
 	return available, nil
+}
+
+func filterAvailableByLoadCeiling(available []*Auth, provider, model string) ([]*Auth, error) {
+	if len(available) == 0 || !loadAwareSelectionEnabled(available) {
+		return available, nil
+	}
+
+	unsaturated := make([]*Auth, 0, len(available))
+	for _, auth := range available {
+		if auth == nil {
+			continue
+		}
+		limit := authMaxInFlight(auth)
+		if limit > 0 && auth.CurrentInFlight >= limit {
+			continue
+		}
+		unsaturated = append(unsaturated, auth)
+	}
+	if len(unsaturated) > 0 {
+		return unsaturated, nil
+	}
+
+	providerForError := provider
+	if providerForError == "mixed" {
+		providerForError = ""
+	}
+	return nil, newModelCooldownError(model, providerForError, defaultLoadBusyRetryAfter)
 }
 
 func ensureWeightedState(states map[string]*weightedCursorState, key string, limit int) map[string]*weightedCursorState {
@@ -734,6 +781,39 @@ func pickWeightedAvailable(states map[string]*weightedCursorState, key string, a
 	return selected
 }
 
+func affinitySelectionScore(provider, model, affinity, authID string) uint64 {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		strings.TrimSpace(provider),
+		canonicalModelKey(model),
+		strings.TrimSpace(affinity),
+		strings.TrimSpace(authID),
+	}, "\n")))
+	return binary.BigEndian.Uint64(sum[:8])
+}
+
+func pickAffinityAvailable(provider, model, affinity string, available []*Auth) *Auth {
+	if len(available) == 0 || strings.TrimSpace(affinity) == "" {
+		return nil
+	}
+
+	bestIndex := -1
+	var bestScore uint64
+	for index, auth := range available {
+		if auth == nil {
+			continue
+		}
+		score := affinitySelectionScore(provider, model, affinity, auth.ID)
+		if bestIndex == -1 || score > bestScore || (score == bestScore && auth.ID < available[bestIndex].ID) {
+			bestIndex = index
+			bestScore = score
+		}
+	}
+	if bestIndex < 0 {
+		return nil
+	}
+	return available[bestIndex]
+}
+
 // Pick selects the next available auth for the provider in a round-robin manner.
 // For gemini-cli virtual auths (identified by the gemini_virtual_parent attribute),
 // a two-level round-robin is used: first cycling across credential groups (parent
@@ -746,6 +826,19 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	if strings.EqualFold(strings.TrimSpace(provider), "claude") {
+		if affinity := authSelectionAffinity(opts.Metadata); affinity != "" {
+			available, err = filterAvailableByLoadCeiling(available, provider, model)
+			if err != nil {
+				return nil, err
+			}
+			selected := pickAffinityAvailable(provider, model, affinity, available)
+			if selected == nil {
+				return nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+			}
+			return selected, nil
+		}
+	}
 	available, err = filterAvailableByCurrentLoad(available, provider, model, now)
 	if err != nil {
 		return nil, err

@@ -6,10 +6,15 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +60,17 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 const (
 	defaultStreamingKeepAliveSeconds = 15
 	defaultStreamingBootstrapRetries = 0
+	theClawBayGatewaySignatureMaxAge = 15 * time.Minute
+)
+
+const (
+	theClawBaySignedUserIDHeader         = "x-theclawbay-user-id"
+	theClawBaySignedAPIKeyIDHeader       = "x-theclawbay-api-key-id"
+	theClawBaySignedPlanMultiplierHeader = "x-theclawbay-plan-multiplier"
+	theClawBaySignedAtHeader             = "x-theclawbay-signed-at"
+	theClawBaySignedNonceHeader          = "x-theclawbay-signature-nonce"
+	theClawBaySignatureHeader            = "x-theclawbay-signature"
+	claudeProxySecretHeader              = "x-claude-proxy-secret"
 )
 
 type pinnedAuthContextKey struct{}
@@ -286,7 +302,114 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
+	if affinityKey := trustedClaudeAuthAffinityKeyFromContext(ctx); affinityKey != "" {
+		meta[coreexecutor.AuthAffinityMetadataKey] = affinityKey
+	}
 	return meta
+}
+
+func trustedClaudeAuthAffinityKeyFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	ginCtx, ok := ctx.Value(util.ContextKeyGin).(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil {
+		return ""
+	}
+	req := ginCtx.Request
+	userID := strings.TrimSpace(req.Header.Get(theClawBaySignedUserIDHeader))
+	apiKeyID := strings.TrimSpace(req.Header.Get(theClawBaySignedAPIKeyIDHeader))
+	if userID == "" || apiKeyID == "" {
+		return ""
+	}
+	if !trustedTheClawBayGatewayHeaders(req, userID, apiKeyID) {
+		return ""
+	}
+	return "tcb:" + userID + ":" + apiKeyID
+}
+
+func trustedTheClawBayGatewayHeaders(req *http.Request, userID, apiKeyID string) bool {
+	if req == nil {
+		return false
+	}
+	if hasTrustedClaudeProxySecret(req) {
+		return true
+	}
+	return hasValidTheClawBayGatewaySignature(req, userID, apiKeyID)
+}
+
+func hasTrustedClaudeProxySecret(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	expected := strings.TrimSpace(os.Getenv("CLAUDE_UPSTREAM_PROXY_SECRET"))
+	if expected == "" {
+		expected = strings.TrimSpace(os.Getenv("CLAUDE_PROXY_SECRET"))
+	}
+	if expected == "" {
+		return false
+	}
+	provided := strings.TrimSpace(req.Header.Get(claudeProxySecretHeader))
+	if provided == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
+func hasValidTheClawBayGatewaySignature(req *http.Request, userID, apiKeyID string) bool {
+	if req == nil {
+		return false
+	}
+	secret := strings.TrimSpace(os.Getenv("CODEX_LB_PROXY_SIGNING_SECRET"))
+	if secret == "" {
+		return false
+	}
+	signedAtRaw := strings.TrimSpace(req.Header.Get(theClawBaySignedAtHeader))
+	nonce := strings.TrimSpace(req.Header.Get(theClawBaySignedNonceHeader))
+	signature := strings.TrimSpace(req.Header.Get(theClawBaySignatureHeader))
+	if signedAtRaw == "" || nonce == "" || signature == "" {
+		return false
+	}
+	signedAt, err := time.Parse(time.RFC3339, signedAtRaw)
+	if err != nil {
+		return false
+	}
+	now := time.Now()
+	if signedAt.Before(now.Add(-theClawBayGatewaySignatureMaxAge)) || signedAt.After(now.Add(theClawBayGatewaySignatureMaxAge)) {
+		return false
+	}
+	planMultiplier := 1
+	if raw := strings.TrimSpace(req.Header.Get(theClawBaySignedPlanMultiplierHeader)); raw != "" {
+		if parsed, errParse := strconv.Atoi(raw); errParse == nil && parsed > 0 {
+			planMultiplier = parsed
+		}
+	}
+	pathWithSearch := ""
+	if req.URL != nil {
+		pathWithSearch = req.URL.RequestURI()
+	}
+	if pathWithSearch == "" && req.URL != nil {
+		pathWithSearch = req.URL.Path
+		if req.URL.RawQuery != "" {
+			pathWithSearch += "?" + req.URL.RawQuery
+		}
+	}
+	if pathWithSearch == "" {
+		return false
+	}
+	payload := strings.Join([]string{
+		strings.ToUpper(strings.TrimSpace(req.Method)),
+		pathWithSearch,
+		userID,
+		apiKeyID,
+		strconv.Itoa(planMultiplier),
+		signedAtRaw,
+		nonce,
+	}, "\n")
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(payload))
+	expected := fmt.Sprintf("%x", mac.Sum(nil))
+	return subtle.ConstantTimeCompare([]byte(strings.ToLower(signature)), []byte(expected)) == 1
 }
 
 func isGroupedRouteRequestMeta(meta map[string]any) bool {
