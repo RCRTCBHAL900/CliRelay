@@ -613,6 +613,63 @@ func TestClaudeExecutorAppliesClaudeIdentityFingerprint(t *testing.T) {
 	}
 }
 
+func TestClaudeFingerprintSessionID_ServerStableUsesExecutionAndAffinity(t *testing.T) {
+	t.Parallel()
+
+	fp := config.ClaudeIdentityFingerprintConfig{SessionMode: "server-stable"}
+	auth := &cliproxyauth.Auth{
+		ID: "auth-1",
+		Metadata: map[string]any{
+			"account_uuid": "account-uuid-123",
+		},
+	}
+
+	optsA := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "exec-1",
+			cliproxyexecutor.AuthAffinityMetadataKey:     "tcb:user-1:key-1",
+			cliproxyexecutor.SelectedAuthMetadataKey:     "auth-1",
+		},
+	}
+	optsB := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "exec-2",
+			cliproxyexecutor.AuthAffinityMetadataKey:     "tcb:user-2:key-1",
+			cliproxyexecutor.SelectedAuthMetadataKey:     "auth-1",
+		},
+	}
+
+	got1 := claudeFingerprintSessionID(fp, auth, optsA)
+	got2 := claudeFingerprintSessionID(fp, auth, optsA)
+	got3 := claudeFingerprintSessionID(fp, auth, optsB)
+
+	if got1 == "" {
+		t.Fatal("expected stable session id to be populated")
+	}
+	if got1 != got2 {
+		t.Fatalf("stable session changed for identical execution metadata: %q vs %q", got1, got2)
+	}
+	if got1 == got3 {
+		t.Fatalf("stable session should differ when execution/affinity changes: %q", got1)
+	}
+}
+
+func TestClaudeFingerprintSessionID_ServerStableFallsBackToGlobalStable(t *testing.T) {
+	t.Parallel()
+
+	fp := config.ClaudeIdentityFingerprintConfig{SessionMode: "server-stable"}
+
+	got1 := claudeFingerprintSessionID(fp, nil, cliproxyexecutor.Options{})
+	got2 := claudeFingerprintSessionID(fp, nil, cliproxyexecutor.Options{})
+
+	if got1 == "" {
+		t.Fatal("expected fallback stable session id to be populated")
+	}
+	if got1 != got2 {
+		t.Fatalf("server-stable fallback changed across calls: %q vs %q", got1, got2)
+	}
+}
+
 func TestStripClaudeToolPrefixFromResponse_NestedToolReference(t *testing.T) {
 	input := []byte(`{"content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"tool_reference","tool_name":"proxy_mcp__nia__manage_resource"}]}]}`)
 	out := stripClaudeToolPrefixFromResponse(input, "proxy_")

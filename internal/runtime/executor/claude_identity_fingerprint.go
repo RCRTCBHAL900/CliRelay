@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -43,7 +44,7 @@ func claudeServerStableSessionID() string {
 	return claudeServerSessionID
 }
 
-func claudeFingerprintSessionID(fp config.ClaudeIdentityFingerprintConfig) string {
+func claudeFingerprintSessionID(fp config.ClaudeIdentityFingerprintConfig, auth *cliproxyauth.Auth, opts cliproxyexecutor.Options) string {
 	switch strings.TrimSpace(strings.ToLower(fp.SessionMode)) {
 	case "fixed":
 		if strings.TrimSpace(fp.SessionID) != "" {
@@ -51,9 +52,50 @@ func claudeFingerprintSessionID(fp config.ClaudeIdentityFingerprintConfig) strin
 		}
 		return claudeServerStableSessionID()
 	case "server-stable":
+		if sessionID := claudeFingerprintContextStableSessionID(auth, opts); sessionID != "" {
+			return sessionID
+		}
 		return claudeServerStableSessionID()
 	default:
 		return uuid.NewString()
+	}
+}
+
+func claudeFingerprintContextStableSessionID(auth *cliproxyauth.Auth, opts cliproxyexecutor.Options) string {
+	seeds := make([]string, 0, 4)
+	if executionSessionID := claudeFingerprintMetadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); executionSessionID != "" {
+		seeds = append(seeds, "exec:"+executionSessionID)
+	}
+	if affinityKey := claudeFingerprintMetadataString(opts.Metadata, cliproxyexecutor.AuthAffinityMetadataKey); affinityKey != "" {
+		seeds = append(seeds, "affinity:"+affinityKey)
+	}
+	if selectedAuthID := claudeFingerprintMetadataString(opts.Metadata, cliproxyexecutor.SelectedAuthMetadataKey); selectedAuthID != "" {
+		seeds = append(seeds, "selected-auth:"+selectedAuthID)
+	}
+	if accountUUID := strings.TrimSpace(claudeFingerprintAccountUUID(auth)); accountUUID != "" {
+		seeds = append(seeds, "account:"+accountUUID)
+	}
+	if len(seeds) == 0 {
+		return ""
+	}
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(strings.Join(seeds, "|"))).String()
+}
+
+func claudeFingerprintMetadataString(metadata map[string]any, key string) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	raw, ok := metadata[key]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []byte:
+		return strings.TrimSpace(string(value))
+	default:
+		return strings.TrimSpace(fmt.Sprint(value))
 	}
 }
 
