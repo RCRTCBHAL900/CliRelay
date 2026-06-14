@@ -529,6 +529,9 @@ func TestClaudeExecutorFingerprintStillInjectsToolAndMessageCacheControls(t *tes
 	}
 	payload := []byte(`{
 		"model":"claude-sonnet-4-5",
+		"system":[
+			{"type":"text","text":"Project instructions that should stay cacheable."}
+		],
 		"tools":[
 			{"name":"Read","description":"Read file","input_schema":{"type":"object"}},
 			{"name":"Write","description":"Write file","input_schema":{"type":"object"}}
@@ -551,8 +554,11 @@ func TestClaudeExecutorFingerprintStillInjectsToolAndMessageCacheControls(t *tes
 		t.Fatalf("Execute error: %v", err)
 	}
 
-	if got := gjson.GetBytes(gotBody, "system.1.cache_control.type").String(); got != "ephemeral" {
-		t.Fatalf("system fingerprint cache_control = %q, want ephemeral", got)
+	if got := gjson.GetBytes(gotBody, "system.1.cache_control").String(); got != "" {
+		t.Fatalf("fingerprint prefix cache_control = %q, want empty so the final system block stays cacheable", got)
+	}
+	if got := gjson.GetBytes(gotBody, "system.2.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("final system cache_control = %q, want ephemeral", got)
 	}
 	if got := gjson.GetBytes(gotBody, "tools.1.cache_control.type").String(); got != "ephemeral" {
 		t.Fatalf("last tool cache_control = %q, want ephemeral", got)

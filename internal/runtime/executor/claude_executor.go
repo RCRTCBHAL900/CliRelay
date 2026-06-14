@@ -1264,51 +1264,6 @@ func ensureCacheControl(payload []byte) []byte {
 	return payload
 }
 
-func countCacheControls(payload []byte) int {
-	count := 0
-
-	// Check system
-	system := gjson.GetBytes(payload, "system")
-	if system.IsArray() {
-		system.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				count++
-			}
-			return true
-		})
-	}
-
-	// Check tools
-	tools := gjson.GetBytes(payload, "tools")
-	if tools.IsArray() {
-		tools.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("cache_control").Exists() {
-				count++
-			}
-			return true
-		})
-	}
-
-	// Check messages
-	messages := gjson.GetBytes(payload, "messages")
-	if messages.IsArray() {
-		messages.ForEach(func(_, msg gjson.Result) bool {
-			content := msg.Get("content")
-			if content.IsArray() {
-				content.ForEach(func(_, item gjson.Result) bool {
-					if item.Get("cache_control").Exists() {
-						count++
-					}
-					return true
-				})
-			}
-			return true
-		})
-	}
-
-	return count
-}
-
 // injectMessagesCacheControl adds cache_control to the second-to-last user turn for multi-turn caching.
 // Per Anthropic docs: "Place cache_control on the second-to-last User message to let the model reuse the earlier cache."
 // This enables caching of conversation history, which is especially beneficial for long multi-turn conversations.

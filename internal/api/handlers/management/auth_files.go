@@ -1645,6 +1645,41 @@ func (h *Handler) selectAutomaticProxyEntry(provider string, authID string) *con
 	return &entry
 }
 
+func (h *Handler) assignAutomaticClaudeProxyToRecord(record *coreauth.Auth) {
+	if record == nil {
+		return
+	}
+	provider := strings.ToLower(strings.TrimSpace(record.Provider))
+	if provider == "" {
+		provider = strings.ToLower(strings.TrimSpace(metadataString(record.Metadata, "type", "provider")))
+	}
+	if provider != "claude" {
+		return
+	}
+	if strings.TrimSpace(record.ProxyID) != "" || strings.TrimSpace(record.ProxyURL) != "" {
+		return
+	}
+	authID := strings.TrimSpace(record.ID)
+	if authID == "" {
+		authID = strings.TrimSpace(record.FileName)
+	}
+	assigned := h.selectAutomaticProxyEntry(provider, authID)
+	if assigned == nil {
+		return
+	}
+	if record.Metadata == nil {
+		record.Metadata = make(map[string]any)
+	}
+	if assignedID := strings.TrimSpace(assigned.ID); assignedID != "" {
+		record.ProxyID = assignedID
+		record.Metadata["proxy_id"] = assignedID
+	}
+	if resolvedURL := resolveAutomaticProxyURL(*assigned); resolvedURL != "" {
+		record.ProxyURL = resolvedURL
+		record.Metadata["proxy_url"] = resolvedURL
+	}
+}
+
 func (h *Handler) listEnabledProxyPoolEntries() []config.ProxyPoolEntry {
 	var entries []config.ProxyPoolEntry
 	if usage.ProxyPoolStoreAvailable() {
@@ -2190,6 +2225,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")
 	}
+	h.assignAutomaticClaudeProxyToRecord(record)
 	if h.postAuthHook != nil {
 		if err := h.postAuthHook(ctx, record); err != nil {
 			return "", fmt.Errorf("post-auth hook failed: %w", err)

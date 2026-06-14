@@ -176,9 +176,8 @@ func applyClaudeFingerprintSystem(auth *cliproxyauth.Auth, payload []byte, fp co
 	next := []map[string]any{
 		{"type": "text", "text": buildClaudeBillingHeader(auth, fp)},
 		{
-			"type":          "text",
-			"text":          "You are Claude Code, Anthropic's official CLI for Claude.",
-			"cache_control": map[string]string{"type": "ephemeral"},
+			"type": "text",
+			"text": "You are Claude Code, Anthropic's official CLI for Claude.",
 		},
 	}
 	next = append(next, remaining...)

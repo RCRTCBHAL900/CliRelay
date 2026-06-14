@@ -254,6 +254,71 @@ func TestRegisterAuthFromFileFallsBackToObservedClaudeLanes(t *testing.T) {
 	}
 }
 
+func TestSaveTokenRecordAutoAssignsClaudeSourceIPLane(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := &Handler{
+		cfg: &config.Config{
+			ProxyPool: []config.ProxyPoolEntry{
+				{ID: "lane-a", Name: "Lane A", SourceIP: "152.89.86.108", Enabled: true},
+				{ID: "lane-b", Name: "Lane B", SourceIP: "152.89.86.109", Enabled: true},
+			},
+		},
+		authManager: manager,
+		tokenStore:  store,
+	}
+
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "existing.json",
+		FileName: "existing.json",
+		Provider: "claude",
+		ProxyID:  "lane-a",
+		ProxyURL: "sourceip://152.89.86.108",
+		Metadata: map[string]any{
+			"type":      "claude",
+			"proxy_id":  "lane-a",
+			"proxy_url": "sourceip://152.89.86.108",
+		},
+	}); err != nil {
+		t.Fatalf("register existing auth: %v", err)
+	}
+
+	record := &coreauth.Auth{
+		ID:       "new.json",
+		FileName: "new.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":  "claude",
+			"email": "new@example.com",
+		},
+	}
+
+	if _, err := h.saveTokenRecord(context.Background(), record); err != nil {
+		t.Fatalf("saveTokenRecord: %v", err)
+	}
+
+	store.mu.Lock()
+	saved := store.items["new.json"]
+	store.mu.Unlock()
+	if saved == nil {
+		t.Fatalf("saved auth not found")
+	}
+	if saved.ProxyID != "lane-b" {
+		t.Fatalf("ProxyID = %q, want lane-b", saved.ProxyID)
+	}
+	if saved.ProxyURL != "sourceip://152.89.86.109" {
+		t.Fatalf("ProxyURL = %q, want sourceip://152.89.86.109", saved.ProxyURL)
+	}
+	if got, _ := saved.Metadata["proxy_id"].(string); got != "lane-b" {
+		t.Fatalf("metadata proxy_id = %#v, want lane-b", saved.Metadata["proxy_id"])
+	}
+	if got, _ := saved.Metadata["proxy_url"].(string); got != "sourceip://152.89.86.109" {
+		t.Fatalf("metadata proxy_url = %#v, want sourceip://152.89.86.109", saved.Metadata["proxy_url"])
+	}
+}
+
 func TestListAuthFilesSupportsProviderSearchAndPagination(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
