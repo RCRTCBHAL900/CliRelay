@@ -665,6 +665,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if name == "" {
 		name = auth.ID
 	}
+	statusMessage := normalizeAuthStatusMessage(auth.StatusMessage)
 	entry := gin.H{
 		"id":             auth.ID,
 		"auth_index":     auth.Index,
@@ -673,7 +674,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"provider":       strings.TrimSpace(auth.Provider),
 		"label":          auth.ChannelName(),
 		"status":         auth.Status,
-		"status_message": auth.StatusMessage,
+		"status_message": statusMessage,
 		"disabled":       auth.Disabled,
 		"unavailable":    auth.Unavailable,
 		"runtime_only":   runtimeOnly,
@@ -724,7 +725,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			entry["modtime"] = info.ModTime()
 		} else if os.IsNotExist(err) {
 			// Hide credentials removed from disk but still lingering in memory.
-			if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
+			if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(statusMessage, "removed via management api")) {
 				return nil
 			}
 			entry["source"] = "memory"
@@ -736,6 +737,18 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		entry["id_token"] = claims
 	}
 	return entry
+}
+
+func normalizeAuthStatusMessage(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	decoded, err := util.DecodeMaybeCompressedHTTPBody([]byte(trimmed), "")
+	if err != nil {
+		return trimmed
+	}
+	return strings.TrimSpace(string(decoded))
 }
 
 func buildAuthRestrictionPayload(auth *coreauth.Auth, now time.Time) []gin.H {
@@ -914,9 +927,9 @@ func buildRestrictionEntry(scope, model string, status coreauth.Status, statusMe
 	if model != "" {
 		entry["model"] = model
 	}
-	statusMessage = strings.TrimSpace(statusMessage)
+	statusMessage = normalizeAuthStatusMessage(statusMessage)
 	if statusMessage == "" && lastError != nil {
-		statusMessage = strings.TrimSpace(lastError.Message)
+		statusMessage = normalizeAuthStatusMessage(lastError.Message)
 	}
 	if statusMessage != "" {
 		entry["status_message"] = statusMessage

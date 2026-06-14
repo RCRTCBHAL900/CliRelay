@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -17,6 +19,19 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+func gzipClaudeBody(t *testing.T, raw string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	if _, err := writer.Write([]byte(raw)); err != nil {
+		t.Fatalf("gzip write failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("gzip close failed: %v", err)
+	}
+	return buf.Bytes()
+}
 
 func TestApplyClaudeToolPrefix(t *testing.T) {
 	input := []byte(`{"tools":[{"name":"alpha"},{"name":"proxy_bravo"}],"tool_choice":{"type":"tool","name":"charlie"},"messages":[{"role":"assistant","content":[{"type":"tool_use","name":"delta","id":"t1","input":{}}]}]}`)
@@ -414,6 +429,150 @@ func TestClaudeExecutorAppliesClaudeIdentityFingerprint(t *testing.T) {
 	if userID.DeviceID != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ||
 		userID.AccountUUID != "account-uuid-123" || userID.SessionID != "session-fixed-123" {
 		t.Fatalf("metadata.user_id = %#v, want device/account/session fingerprint", userID)
+	}
+}
+
+func TestClaudeIdentityFingerprintBillingHeaderIsStableAcrossPromptChanges(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID: "claude-auth-stable-billing",
+		Metadata: map[string]any{
+			"account_uuid": "account-uuid-123",
+		},
+	}
+	fp := config.ClaudeIdentityFingerprintConfig{
+		Enabled:    true,
+		CLIVersion: "2.1.88",
+		Entrypoint: "cli",
+	}
+
+	payloadA := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello from first prompt"}]}]}`)
+	payloadB := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"completely different prompt text"}]}]}`)
+
+	withA := applyClaudeIdentityFingerprintPayload(auth, payloadA, fp, "session-fixed-123")
+	withB := applyClaudeIdentityFingerprintPayload(auth, payloadB, fp, "session-fixed-123")
+
+	billingA := gjson.GetBytes(withA, "system.0.text").String()
+	billingB := gjson.GetBytes(withB, "system.0.text").String()
+
+	if billingA == "" || billingB == "" {
+		t.Fatalf("expected billing header blocks, got %q and %q", billingA, billingB)
+	}
+	if billingA != billingB {
+		t.Fatalf("billing header should stay stable across prompt changes, got %q vs %q", billingA, billingB)
+	}
+}
+
+func TestClaudeExecutorFingerprintStillInjectsToolAndMessageCacheControls(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4-5","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{
+		IdentityFingerprint: config.IdentityFingerprintConfig{
+			Claude: config.ClaudeIdentityFingerprintConfig{
+				Enabled:     true,
+				CLIVersion:  "2.1.88",
+				Entrypoint:  "cli",
+				SessionMode: "fixed",
+				SessionID:   "session-fixed-123",
+				DeviceID:    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			},
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"api_key":  "oauth-access-token",
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{
+			"type":         "claude",
+			"account_uuid": "account-uuid-123",
+		},
+	}
+	payload := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"tools":[
+			{"name":"Read","description":"Read file","input_schema":{"type":"object"}},
+			{"name":"Write","description":"Write file","input_schema":{"type":"object"}}
+		],
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"first user"}]},
+			{"role":"assistant","content":[{"type":"text","text":"assistant reply"}]},
+			{"role":"user","content":[{"type":"text","text":"second user"}]},
+			{"role":"assistant","content":[{"type":"text","text":"assistant reply 2"}]},
+			{"role":"user","content":[{"type":"text","text":"third user"}]}
+		]
+	}`)
+
+	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	}); err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if got := gjson.GetBytes(gotBody, "system.1.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("system fingerprint cache_control = %q, want ephemeral", got)
+	}
+	if got := gjson.GetBytes(gotBody, "tools.1.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("last tool cache_control = %q, want ephemeral", got)
+	}
+	if got := gjson.GetBytes(gotBody, "messages.2.content.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("second-to-last user cache_control = %q, want ephemeral", got)
+	}
+}
+
+func TestClaudeExecutor_DecodesCompressedErrorAndHonorsRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Retry-After", "17")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write(gzipClaudeBody(t, `{"error":{"message":"temporary high demand"}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "oauth-access-token",
+		"base_url": server.URL,
+	}}
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: []byte(`{"model":"claude-opus-4-8","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	status, ok := err.(statusErr)
+	if !ok {
+		t.Fatalf("error type = %T, want statusErr", err)
+	}
+	if status.code != http.StatusTooManyRequests {
+		t.Fatalf("status.code = %d, want %d", status.code, http.StatusTooManyRequests)
+	}
+	if status.msg != `{"error":{"message":"temporary high demand"}}` {
+		t.Fatalf("status.msg = %q, want decoded JSON error", status.msg)
+	}
+	if status.retryAfter == nil {
+		t.Fatal("expected retryAfter to be populated")
+	}
+	if *status.retryAfter != 17*time.Second {
+		t.Fatalf("retryAfter = %v, want %v", *status.retryAfter, 17*time.Second)
 	}
 }
 
