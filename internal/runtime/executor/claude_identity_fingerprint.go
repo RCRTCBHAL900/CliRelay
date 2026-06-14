@@ -114,7 +114,7 @@ func mergeClaudeBetaHeader(base string, extraBetas []string) string {
 }
 
 func applyClaudeIdentityFingerprintPayload(auth *cliproxyauth.Auth, payload []byte, fp config.ClaudeIdentityFingerprintConfig, sessionID string) []byte {
-	payload = applyClaudeFingerprintSystem(payload, fp)
+	payload = applyClaudeFingerprintSystem(auth, payload, fp)
 	userID, err := json.Marshal(claudeFingerprintUserID{
 		DeviceID:    claudeFingerprintDeviceID(auth, fp),
 		AccountUUID: claudeFingerprintAccountUUID(auth),
@@ -126,7 +126,7 @@ func applyClaudeIdentityFingerprintPayload(auth *cliproxyauth.Auth, payload []by
 	return payload
 }
 
-func applyClaudeFingerprintSystem(payload []byte, fp config.ClaudeIdentityFingerprintConfig) []byte {
+func applyClaudeFingerprintSystem(auth *cliproxyauth.Auth, payload []byte, fp config.ClaudeIdentityFingerprintConfig) []byte {
 	system := gjson.GetBytes(payload, "system")
 	remaining := make([]map[string]any, 0)
 	appendText := func(text string, cache bool) {
@@ -156,7 +156,7 @@ func applyClaudeFingerprintSystem(payload []byte, fp config.ClaudeIdentityFinger
 	}
 
 	next := []map[string]any{
-		{"type": "text", "text": buildClaudeBillingHeader(payload, fp)},
+		{"type": "text", "text": buildClaudeBillingHeader(auth, fp)},
 		{
 			"type":          "text",
 			"text":          "You are Claude Code, Anthropic's official CLI for Claude.",
@@ -172,41 +172,26 @@ func applyClaudeFingerprintSystem(payload []byte, fp config.ClaudeIdentityFinger
 	return payload
 }
 
-func buildClaudeBillingHeader(payload []byte, fp config.ClaudeIdentityFingerprintConfig) string {
-	fingerprint := computeClaudeBillingFingerprint(firstClaudeUserMessageText(payload), fp.CLIVersion)
+func buildClaudeBillingHeader(auth *cliproxyauth.Auth, fp config.ClaudeIdentityFingerprintConfig) string {
+	fingerprint := computeClaudeBillingFingerprint(claudeBillingFingerprintSeed(auth, fp), fp.CLIVersion)
 	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s;", fp.CLIVersion, fingerprint, fp.Entrypoint)
 }
 
-func firstClaudeUserMessageText(payload []byte) string {
-	messages := gjson.GetBytes(payload, "messages")
-	for _, msg := range messages.Array() {
-		if msg.Get("role").String() != "user" {
-			continue
-		}
-		content := msg.Get("content")
-		if content.Type == gjson.String {
-			return content.String()
-		}
-		if content.IsArray() {
-			for _, block := range content.Array() {
-				if block.Get("type").String() == "text" {
-					return block.Get("text").String()
-				}
-			}
-		}
+func claudeBillingFingerprintSeed(auth *cliproxyauth.Auth, fp config.ClaudeIdentityFingerprintConfig) string {
+	if accountUUID := claudeFingerprintAccountUUID(auth); accountUUID != "" {
+		return accountUUID
 	}
-	return ""
+	if deviceID := claudeFingerprintDeviceID(auth, fp); deviceID != "" {
+		return deviceID
+	}
+	if auth != nil && strings.TrimSpace(auth.ID) != "" {
+		return strings.TrimSpace(auth.ID)
+	}
+	return "claude-oauth"
 }
 
-func computeClaudeBillingFingerprint(messageText, version string) string {
-	chars := []rune(messageText)
-	pick := func(index int) rune {
-		if index >= 0 && index < len(chars) {
-			return chars[index]
-		}
-		return '0'
-	}
-	input := fmt.Sprintf("%s%c%c%c%s", claudeFingerprintSalt, pick(4), pick(7), pick(20), version)
+func computeClaudeBillingFingerprint(seed, version string) string {
+	input := fmt.Sprintf("%s|%s|%s", claudeFingerprintSalt, seed, version)
 	sum := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(sum[:])[:3]
 }

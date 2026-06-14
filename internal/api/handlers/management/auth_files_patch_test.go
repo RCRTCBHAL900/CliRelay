@@ -2,6 +2,7 @@ package management
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -19,6 +20,19 @@ import (
 
 type failingAuthStore struct {
 	items map[string]*coreauth.Auth
+}
+
+func gzipStatusMessage(t *testing.T, raw string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	if _, err := writer.Write([]byte(raw)); err != nil {
+		t.Fatalf("gzip write failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("gzip close failed: %v", err)
+	}
+	return string(buf.Bytes())
 }
 
 func (s *failingAuthStore) List(ctx context.Context) ([]*coreauth.Auth, error) {
@@ -1036,5 +1050,26 @@ func TestPatchAuthFileFieldsReturnsErrorWhenPersistenceFails(t *testing.T) {
 	}
 	if updated.ChannelName() == "Broken Persist" {
 		t.Fatalf("expected in-memory auth rollback on persist failure, got channel=%q", updated.ChannelName())
+	}
+}
+
+func TestBuildAuthFileEntryDecodesCompressedStatusMessage(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:            "claude-gzip-status",
+		FileName:      "claude-gzip-status.json",
+		Provider:      "claude",
+		Status:        coreauth.StatusError,
+		StatusMessage: gzipStatusMessage(t, `{"error":{"message":"quota exhausted"}}`),
+		Attributes: map[string]string{
+			"path": "claude-gzip-status.json",
+		},
+	}
+
+	entry := (&Handler{}).buildAuthFileEntry(auth)
+	if entry == nil {
+		t.Fatal("expected auth file entry")
+	}
+	if got := entry["status_message"]; got != `{"error":{"message":"quota exhausted"}}` {
+		t.Fatalf("status_message = %#v, want decoded JSON", got)
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 )
 
 type upstreamBodyReadLimit struct {
@@ -49,6 +51,15 @@ func readUpstreamErrorBody(provider string, r io.Reader) []byte {
 		data = append(data, []byte(fmt.Sprintf("\n[cliproxy: upstream error body truncated at %s]", formatByteLimit(limit)))...)
 	}
 	return data
+}
+
+func readUpstreamErrorBodyDecoded(provider string, r io.Reader, contentEncoding string) []byte {
+	data := readUpstreamErrorBody(provider, r)
+	decoded, err := util.DecodeMaybeCompressedHTTPBody(data, contentEncoding)
+	if err != nil {
+		return data
+	}
+	return decoded
 }
 
 func readBodyAtMost(r io.Reader, limit int64) ([]byte, bool, error) {

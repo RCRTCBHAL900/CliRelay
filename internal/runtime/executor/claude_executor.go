@@ -42,6 +42,33 @@ func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecu
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
 
+func parseHTTPRetryAfter(headerValue string, now time.Time) *time.Duration {
+	trimmed := strings.TrimSpace(headerValue)
+	if trimmed == "" {
+		return nil
+	}
+	if seconds, err := time.ParseDuration(trimmed + "s"); err == nil && seconds > 0 {
+		return &seconds
+	}
+	if retryAt, err := http.ParseTime(trimmed); err == nil && retryAt.After(now) {
+		duration := retryAt.Sub(now)
+		return &duration
+	}
+	return nil
+}
+
+func newClaudeStatusErr(statusCode int, headers http.Header, body []byte) statusErr {
+	err := statusErr{
+		code:         statusCode,
+		msg:          string(body),
+		upstreamBody: append([]byte(nil), body...),
+	}
+	if retryAfter := parseHTTPRetryAfter(headers.Get("Retry-After"), time.Now()); retryAfter != nil {
+		err.retryAfter = retryAfter
+	}
+	return err
+}
+
 // PrepareRequest injects Claude credentials into the outgoing HTTP request.
 func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -137,10 +164,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 		body = disableThinkingIfToolChoiceForced(body)
 
-		// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-		if countCacheControls(body) == 0 {
-			body = ensureCacheControl(body)
-		}
+		// Ensure the independent Claude cache breakpoints are present.
+		// Fingerprint mode already injects one system cache_control block, but
+		// tools and multi-turn message history still need their own breakpoints.
+		body = ensureCacheControl(body)
 	}
 
 	// Extract betas from body and convert to header
@@ -185,11 +212,15 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b := readUpstreamErrorBody(e.Identifier(), httpResp.Body)
+		b := readUpstreamErrorBodyDecoded(
+			e.Identifier(),
+			httpResp.Body,
+			httpResp.Header.Get("Content-Encoding"),
+		)
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		reporter.publishFailureWithContent(ctx, string(req.Payload), string(b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = newClaudeStatusErr(httpResp.StatusCode, httpResp.Header.Clone(), b)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
@@ -293,10 +324,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 		body = disableThinkingIfToolChoiceForced(body)
 
-		// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-		if countCacheControls(body) == 0 {
-			body = ensureCacheControl(body)
-		}
+		// Ensure the independent Claude cache breakpoints are present.
+		// Fingerprint mode already injects one system cache_control block, but
+		// tools and multi-turn message history still need their own breakpoints.
+		body = ensureCacheControl(body)
 	}
 
 	// Extract betas from body and convert to header
@@ -341,14 +372,18 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b := readUpstreamErrorBody(e.Identifier(), httpResp.Body)
+		b := readUpstreamErrorBodyDecoded(
+			e.Identifier(),
+			httpResp.Body,
+			httpResp.Header.Get("Content-Encoding"),
+		)
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		reporter.publishFailureWithContent(ctx, string(req.Payload), string(b))
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = newClaudeStatusErr(httpResp.StatusCode, httpResp.Header.Clone(), b)
 		return nil, err
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
@@ -497,12 +532,16 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b := readUpstreamErrorBody(e.Identifier(), resp.Body)
+		b := readUpstreamErrorBodyDecoded(
+			e.Identifier(),
+			resp.Body,
+			resp.Header.Get("Content-Encoding"),
+		)
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		if errClose := resp.Body.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(b)}
+		return cliproxyexecutor.Response{}, newClaudeStatusErr(resp.StatusCode, resp.Header.Clone(), b)
 	}
 	decodedBody, err := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
 	if err != nil {
