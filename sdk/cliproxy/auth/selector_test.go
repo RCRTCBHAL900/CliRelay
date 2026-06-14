@@ -35,6 +35,22 @@ func TestFillFirstSelectorPick_Deterministic(t *testing.T) {
 	}
 }
 
+func TestAuthMaxInFlight_ClaudeDefaultCanBeOverriddenByEnv(t *testing.T) {
+	t.Setenv("CLAUDE_DEFAULT_MAX_INFLIGHT", "1")
+	auth := &Auth{Provider: "claude"}
+	if got := authMaxInFlight(auth); got != 1 {
+		t.Fatalf("authMaxInFlight() = %d, want 1", got)
+	}
+}
+
+func TestAuthMaxInFlight_ClaudeDefaultFallsBackOnInvalidEnv(t *testing.T) {
+	t.Setenv("CLAUDE_DEFAULT_MAX_INFLIGHT", "bogus")
+	auth := &Auth{Provider: "claude"}
+	if got := authMaxInFlight(auth); got != 2 {
+		t.Fatalf("authMaxInFlight() = %d, want 2", got)
+	}
+}
+
 func TestRoundRobinSelectorPick_CyclesDeterministic(t *testing.T) {
 	t.Parallel()
 

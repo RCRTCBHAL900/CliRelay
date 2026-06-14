@@ -59,9 +59,23 @@ type modelUnavailableError struct {
 
 const (
 	defaultLoadBusyRetryAfter  = time.Second
-	defaultClaudeMaxInFlight   = 2
 	defaultClaudeMinQueueFloor = 0
 )
+
+func defaultClaudeMaxInFlightValue() int {
+	raw := strings.TrimSpace(os.Getenv("CLAUDE_DEFAULT_MAX_INFLIGHT"))
+	if raw == "" {
+		return 2
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 1 {
+		return 2
+	}
+	if parsed > 16 {
+		return 16
+	}
+	return parsed
+}
 
 func newModelCooldownError(model, provider string, resetIn time.Duration) *modelCooldownError {
 	if resetIn < 0 {
@@ -508,21 +522,9 @@ func authMaxInFlight(auth *Auth) int {
 		return val
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
-		return defaultClaudeMaxInFlightLimit()
+		return defaultClaudeMaxInFlightValue()
 	}
 	return 0
-}
-
-func defaultClaudeMaxInFlightLimit() int {
-	raw := strings.TrimSpace(os.Getenv("CLAUDE_DEFAULT_MAX_INFLIGHT"))
-	if raw == "" {
-		return defaultClaudeMaxInFlight
-	}
-	parsed, err := strconv.Atoi(raw)
-	if err != nil || parsed < 0 {
-		return defaultClaudeMaxInFlight
-	}
-	return parsed
 }
 
 func authIntSetting(auth *Auth, keys ...string) (int, bool) {

@@ -159,3 +159,41 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 		t.Fatalf("expected NextRetryAfter to be zero when disable_cooling=true, got %v", state.NextRetryAfter)
 	}
 }
+
+func TestApplyAuthFailureState_QuarantinesHardClaudeAuthFailures(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0)
+	auth := &Auth{Provider: "claude"}
+	err := &Error{
+		HTTPStatus: 401,
+		Message:    `{"type":"error","error":{"type":"authentication_error","message":"Invalid bearer token"}}`,
+	}
+
+	applyAuthFailureState(auth, err, nil, now)
+
+	if auth.StatusMessage != "unauthorized" {
+		t.Fatalf("status message = %q, want unauthorized", auth.StatusMessage)
+	}
+	if got := auth.NextRetryAfter.Sub(now); got < 6*time.Hour {
+		t.Fatalf("next retry cooldown = %v, want at least 6h", got)
+	}
+}
+
+func TestApplyAuthFailureState_KeepsGenericClaude401CooldownShorter(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_700_000_000, 0)
+	auth := &Auth{Provider: "claude"}
+	err := &Error{
+		HTTPStatus: 401,
+		Message:    `upstream auth failed`,
+	}
+
+	applyAuthFailureState(auth, err, nil, now)
+
+	got := auth.NextRetryAfter.Sub(now)
+	if got != 30*time.Minute {
+		t.Fatalf("next retry cooldown = %v, want 30m for generic 401", got)
+	}
+}
