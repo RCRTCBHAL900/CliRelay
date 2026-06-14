@@ -448,8 +448,8 @@ func TestClaudeIdentityFingerprintBillingHeaderIsStableAcrossPromptChanges(t *te
 	payloadA := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello from first prompt"}]}]}`)
 	payloadB := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"completely different prompt text"}]}]}`)
 
-	withA := applyClaudeIdentityFingerprintPayload(auth, payloadA, fp, "session-fixed-123")
-	withB := applyClaudeIdentityFingerprintPayload(auth, payloadB, fp, "session-fixed-123")
+	withA := applyClaudeIdentityFingerprintPayload(auth, payloadA, fp)
+	withB := applyClaudeIdentityFingerprintPayload(auth, payloadB, fp)
 
 	billingA := gjson.GetBytes(withA, "system.0.text").String()
 	billingB := gjson.GetBytes(withB, "system.0.text").String()
@@ -459,6 +459,36 @@ func TestClaudeIdentityFingerprintBillingHeaderIsStableAcrossPromptChanges(t *te
 	}
 	if billingA != billingB {
 		t.Fatalf("billing header should stay stable across prompt changes, got %q vs %q", billingA, billingB)
+	}
+}
+
+func TestClaudeIdentityFingerprintMetadataUserIDIsStableForPerRequestSessions(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID: "claude-auth-stable-user-id",
+		Metadata: map[string]any{
+			"account_uuid": "account-uuid-123",
+		},
+	}
+	fp := config.ClaudeIdentityFingerprintConfig{
+		Enabled:     true,
+		CLIVersion:  "2.1.88",
+		Entrypoint:  "cli",
+		SessionMode: "per-request",
+	}
+
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)
+
+	withA := applyClaudeIdentityFingerprintPayload(auth, payload, fp)
+	withB := applyClaudeIdentityFingerprintPayload(auth, payload, fp)
+
+	userIDA := gjson.GetBytes(withA, "metadata.user_id").String()
+	userIDB := gjson.GetBytes(withB, "metadata.user_id").String()
+
+	if userIDA == "" || userIDB == "" {
+		t.Fatalf("expected metadata.user_id values, got %q and %q", userIDA, userIDB)
+	}
+	if userIDA != userIDB {
+		t.Fatalf("expected metadata.user_id to stay stable for cacheability, got %q vs %q", userIDA, userIDB)
 	}
 }
 

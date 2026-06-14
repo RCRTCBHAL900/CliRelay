@@ -113,17 +113,35 @@ func mergeClaudeBetaHeader(base string, extraBetas []string) string {
 	return strings.Join(out, ",")
 }
 
-func applyClaudeIdentityFingerprintPayload(auth *cliproxyauth.Auth, payload []byte, fp config.ClaudeIdentityFingerprintConfig, sessionID string) []byte {
+func applyClaudeIdentityFingerprintPayload(auth *cliproxyauth.Auth, payload []byte, fp config.ClaudeIdentityFingerprintConfig) []byte {
 	payload = applyClaudeFingerprintSystem(auth, payload, fp)
 	userID, err := json.Marshal(claudeFingerprintUserID{
 		DeviceID:    claudeFingerprintDeviceID(auth, fp),
 		AccountUUID: claudeFingerprintAccountUUID(auth),
-		SessionID:   sessionID,
+		SessionID:   claudeFingerprintMetadataSessionID(auth, fp),
 	})
 	if err == nil {
 		payload, _ = sjson.SetBytes(payload, "metadata.user_id", string(userID))
 	}
 	return payload
+}
+
+func claudeFingerprintMetadataSessionID(auth *cliproxyauth.Auth, fp config.ClaudeIdentityFingerprintConfig) string {
+	switch strings.TrimSpace(strings.ToLower(fp.SessionMode)) {
+	case "fixed":
+		if strings.TrimSpace(fp.SessionID) != "" {
+			return strings.TrimSpace(fp.SessionID)
+		}
+		return claudeServerStableSessionID()
+	case "server-stable":
+		return claudeServerStableSessionID()
+	default:
+		seed := strings.TrimSpace(claudeBillingFingerprintSeed(auth, fp))
+		if seed == "" {
+			seed = "claude-oauth"
+		}
+		return uuid.NewSHA1(uuid.NameSpaceOID, []byte("claude-metadata-session:"+seed)).String()
+	}
 }
 
 func applyClaudeFingerprintSystem(auth *cliproxyauth.Auth, payload []byte, fp config.ClaudeIdentityFingerprintConfig) []byte {
