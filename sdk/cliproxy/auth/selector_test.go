@@ -878,6 +878,31 @@ func TestIsAuthBlockedForModel_AuthQuotaCooldownBlocksAllModels(t *testing.T) {
 	}
 }
 
+func TestIsAuthBlockedForModel_AuthLevelRetryBlocksModelRequests(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	next := now.Add(20 * time.Minute)
+
+	auth := &Auth{
+		ID:             "a",
+		Status:         StatusError,
+		Unavailable:    false,
+		NextRetryAfter: next,
+	}
+
+	blocked, reason, gotNext := isAuthBlockedForModel(auth, "some-new-model", now)
+	if !blocked {
+		t.Fatalf("blocked = false, want true")
+	}
+	if reason != blockReasonOther {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonOther)
+	}
+	if gotNext.IsZero() || gotNext.Sub(next) > time.Second || next.Sub(gotNext) > time.Second {
+		t.Fatalf("next = %v, want around %v", gotNext, next)
+	}
+}
+
 func TestFillFirstSelectorPick_ThinkingSuffixFallsBackToBaseModelState(t *testing.T) {
 	t.Parallel()
 

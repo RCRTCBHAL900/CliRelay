@@ -1633,6 +1633,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				default:
 					state.NextRetryAfter = time.Time{}
 				}
+				if immediate := claudeHardFailureCooldown(result.Provider, statusCode, result.Error); immediate > 0 {
+					next := now.Add(immediate)
+					if state.NextRetryAfter.IsZero() || next.After(state.NextRetryAfter) {
+						state.NextRetryAfter = next
+					}
+					if auth.NextRetryAfter.IsZero() || next.After(auth.NextRetryAfter) {
+						auth.NextRetryAfter = next
+					}
+					auth.Status = StatusError
+					auth.StatusMessage = "unauthorized"
+				}
 				if escalated := failureEscalationCooldown(result.Provider, statusCode, state.ConsecutiveFailures, result.RetryAfter); escalated > 0 {
 					next := now.Add(escalated)
 					if state.NextRetryAfter.IsZero() || next.After(state.NextRetryAfter) {

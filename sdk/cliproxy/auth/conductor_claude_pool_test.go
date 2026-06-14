@@ -198,3 +198,51 @@ func TestManagerExecute_ClaudeAffinityRemembersSuccessfulMixedFailover(t *testin
 		t.Fatalf("second Execute() calls = %q, want a,b,b", got)
 	}
 }
+
+func TestManagerMarkResult_ClaudeInvalidBearerBlocksAuthAcrossModels(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, err := manager.Register(context.Background(), &Auth{
+		ID:       "claude-auth-invalid",
+		Provider: "claude",
+		Status:   StatusActive,
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   "claude-auth-invalid",
+		Provider: "claude",
+		Model:    "claude-opus-4-8",
+		Success:  false,
+		Error: &Error{
+			Code:       "upstream_failed",
+			Message:    `{"type":"error","error":{"type":"authentication_error","message":"Invalid bearer token"}}`,
+			HTTPStatus: http.StatusUnauthorized,
+		},
+	})
+
+	auths := manager.List()
+	if len(auths) != 1 {
+		t.Fatalf("List() len = %d, want 1", len(auths))
+	}
+	auth := auths[0]
+	if auth.NextRetryAfter.IsZero() {
+		t.Fatal("NextRetryAfter is zero after invalid bearer token failure")
+	}
+	if remaining := time.Until(auth.NextRetryAfter); remaining < 5*time.Hour {
+		t.Fatalf("auth.NextRetryAfter cooldown = %v, want long auth-wide cooldown", remaining)
+	}
+
+	blocked, reason, next := isAuthBlockedForModel(auth, "claude-sonnet-4-5", time.Now())
+	if !blocked {
+		t.Fatal("blocked = false, want true for other Claude models too")
+	}
+	if reason != blockReasonOther {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonOther)
+	}
+	if next.IsZero() {
+		t.Fatal("next = zero, want auth-level retry time")
+	}
+}

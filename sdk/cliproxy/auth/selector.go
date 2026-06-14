@@ -1172,6 +1172,19 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 				return false, blockReasonNone, time.Time{}
 			}
 		}
+		if auth.Status == StatusError && auth.NextRetryAfter.After(now) {
+			next := auth.NextRetryAfter
+			if auth.Quota.Exceeded && !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
+				next = auth.Quota.NextRecoverAt
+			}
+			if next.Before(now) {
+				next = now
+			}
+			if auth.Quota.Exceeded {
+				return true, blockReasonCooldown, next
+			}
+			return true, blockReasonOther, next
+		}
 		return false, blockReasonNone, time.Time{}
 	}
 	if auth.Unavailable && auth.NextRetryAfter.After(now) {
