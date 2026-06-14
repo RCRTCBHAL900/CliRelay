@@ -1934,6 +1934,12 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.StatusMessage = "request failed"
 		}
 	}
+	if immediate := claudeHardFailureCooldown(auth.Provider, statusCode, resultErr); immediate > 0 {
+		next := now.Add(immediate)
+		if auth.NextRetryAfter.IsZero() || next.After(auth.NextRetryAfter) {
+			auth.NextRetryAfter = next
+		}
+	}
 	if escalated := failureEscalationCooldown(auth.Provider, statusCode, auth.ConsecutiveFailures, retryAfter); escalated > 0 {
 		next := now.Add(escalated)
 		if auth.NextRetryAfter.IsZero() || next.After(auth.NextRetryAfter) {
@@ -1942,6 +1948,22 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if auth.Quota.Exceeded && (auth.Quota.NextRecoverAt.IsZero() || next.After(auth.Quota.NextRecoverAt)) {
 			auth.Quota.NextRecoverAt = next
 		}
+	}
+}
+
+func claudeHardFailureCooldown(provider string, statusCode int, resultErr *Error) time.Duration {
+	if !strings.EqualFold(strings.TrimSpace(provider), "claude") || statusCode != 401 || resultErr == nil {
+		return 0
+	}
+	message := strings.ToLower(strings.TrimSpace(resultErr.Message))
+	switch {
+	case strings.Contains(message, "invalid bearer token"),
+		strings.Contains(message, "invalid authentication credentials"),
+		strings.Contains(message, "\"type\":\"authentication_error\""),
+		strings.Contains(message, "\"type\": \"authentication_error\""):
+		return 6 * time.Hour
+	default:
+		return 0
 	}
 }
 

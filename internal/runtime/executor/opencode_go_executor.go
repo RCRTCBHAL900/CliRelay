@@ -340,13 +340,23 @@ func opencodeGoClaudeMessageToSSE(data []byte) []byte {
 		return data
 	}
 	var b strings.Builder
-	writeData := func(raw string) {
-		if strings.TrimSpace(raw) == "" {
+	writeEvent := func(event string, raw string) {
+		event = strings.TrimSpace(event)
+		if event == "" {
 			return
 		}
+		b.WriteString("event: ")
+		b.WriteString(event)
+		b.WriteString("\n")
 		b.WriteString("data: ")
 		b.WriteString(raw)
 		b.WriteString("\n\n")
+	}
+	writeData := func(event string, raw string) {
+		if strings.TrimSpace(raw) == "" {
+			return
+		}
+		writeEvent(event, raw)
 	}
 
 	messageStart := `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`
@@ -355,7 +365,7 @@ func opencodeGoClaudeMessageToSSE(data []byte) []byte {
 	if v := root.Get("usage.input_tokens"); v.Exists() {
 		messageStart, _ = sjson.Set(messageStart, "message.usage.input_tokens", v.Int())
 	}
-	writeData(messageStart)
+	writeData("message_start", messageStart)
 
 	index := 0
 	if content := root.Get("content"); content.Exists() && content.IsArray() {
@@ -365,19 +375,19 @@ func opencodeGoClaudeMessageToSSE(data []byte) []byte {
 			case "text":
 				start := `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
 				start, _ = sjson.Set(start, "index", index)
-				writeData(start)
+				writeData("content_block_start", start)
 				delta := `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`
 				delta, _ = sjson.Set(delta, "index", index)
 				delta, _ = sjson.Set(delta, "delta.text", block.Get("text").String())
-				writeData(delta)
+				writeData("content_block_delta", delta)
 			case "thinking":
 				start := `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`
 				start, _ = sjson.Set(start, "index", index)
-				writeData(start)
+				writeData("content_block_start", start)
 				delta := `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`
 				delta, _ = sjson.Set(delta, "index", index)
 				delta, _ = sjson.Set(delta, "delta.thinking", block.Get("thinking").String())
-				writeData(delta)
+				writeData("content_block_delta", delta)
 			case "tool_use":
 				start := `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
 				start, _ = sjson.Set(start, "index", index)
@@ -386,14 +396,14 @@ func opencodeGoClaudeMessageToSSE(data []byte) []byte {
 				if input := block.Get("input"); input.Exists() {
 					start, _ = sjson.SetRaw(start, "content_block.input", input.Raw)
 				}
-				writeData(start)
+				writeData("content_block_start", start)
 			default:
 				index++
 				continue
 			}
 			stop := `{"type":"content_block_stop","index":0}`
 			stop, _ = sjson.Set(stop, "index", index)
-			writeData(stop)
+			writeData("content_block_stop", stop)
 			index++
 		}
 	}
@@ -408,7 +418,7 @@ func opencodeGoClaudeMessageToSSE(data []byte) []byte {
 	if v := root.Get("usage.output_tokens"); v.Exists() {
 		messageDelta, _ = sjson.Set(messageDelta, "usage.output_tokens", v.Int())
 	}
-	writeData(messageDelta)
-	writeData(`{"type":"message_stop"}`)
+	writeData("message_delta", messageDelta)
+	writeData("message_stop", `{"type":"message_stop"}`)
 	return []byte(b.String())
 }

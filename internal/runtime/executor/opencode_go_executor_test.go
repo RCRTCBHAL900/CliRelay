@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -206,5 +207,41 @@ func TestOpenCodeGoExecutorSupportsAnthropicMessagesAPIForOpenAIModels(t *testin
 	}
 	if gotText := gjson.GetBytes(resp.Payload, "content.0.text").String(); gotText != "anthropic ok" {
 		t.Fatalf("anthropic response text = %q, want anthropic ok; payload=%s", gotText, string(resp.Payload))
+	}
+}
+
+func TestOpenCodeGoClaudeMessageToSSEEmitsAnthropicEventFrames(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`{
+		"id":"msg_123",
+		"type":"message",
+		"role":"assistant",
+		"model":"claude-opus-4-8",
+		"content":[
+			{"type":"text","text":"hello"},
+			{"type":"thinking","thinking":"step one"}
+		],
+		"stop_reason":"end_turn",
+		"usage":{"input_tokens":11,"output_tokens":7}
+	}`)
+
+	out := string(opencodeGoClaudeMessageToSSE(input))
+
+	required := []string{
+		"event: message_start\n",
+		"event: content_block_start\n",
+		"event: content_block_delta\n",
+		"event: content_block_stop\n",
+		"event: message_delta\n",
+		"event: message_stop\n",
+		`"type":"message_start"`,
+		`"type":"thinking_delta"`,
+		`"type":"text_delta"`,
+	}
+	for _, needle := range required {
+		if !strings.Contains(out, needle) {
+			t.Fatalf("expected SSE output to contain %q, got %s", needle, out)
+		}
 	}
 }
