@@ -158,3 +158,37 @@ func TestResolveProxyURLAutoRealizesClaudeLaneEntries(t *testing.T) {
 		t.Fatalf("ResolveProxyURL() = %q, want %q", got, "sourceip://65.109.249.42")
 	}
 }
+
+func TestSelectAutomaticSourceIPLaneIsDeterministic(t *testing.T) {
+	previousDiscoverer := discoverAutomaticSourceIPs
+	discoverAutomaticSourceIPs = func() []string {
+		return []string{
+			"65.109.249.3",
+			"65.109.249.42",
+			"65.109.243.117",
+		}
+	}
+	t.Cleanup(func() {
+		discoverAutomaticSourceIPs = previousDiscoverer
+	})
+
+	entries := []ProxyPoolEntry{
+		{ID: "claude-lane-01", Name: "Claude Lane 01", Enabled: true},
+		{ID: "claude-lane-02", Name: "Claude Lane 02", Enabled: true},
+		{ID: "claude-lane-03", Name: "Claude Lane 03", Enabled: true},
+	}
+
+	first := SelectAutomaticSourceIPLane(entries, "auth-a")
+	second := SelectAutomaticSourceIPLane(entries, "auth-a")
+	third := SelectAutomaticSourceIPLane(entries, "auth-b")
+
+	if first == nil || second == nil || third == nil {
+		t.Fatalf("automatic lane selection returned nil: %#v %#v %#v", first, second, third)
+	}
+	if first.ID != second.ID || first.SourceIP != second.SourceIP {
+		t.Fatalf("same seed should stay sticky: %#v vs %#v", first, second)
+	}
+	if third.ID == "" || third.SourceIP == "" {
+		t.Fatalf("third lane selection = %#v", third)
+	}
+}

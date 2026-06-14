@@ -36,6 +36,15 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		if auth != nil {
 			proxyID = auth.ProxyID
 			fallbackURL = auth.ProxyURL
+			if proxyID == "" && strings.TrimSpace(fallbackURL) == "" && strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+				seed := strings.TrimSpace(auth.ID)
+				if seed == "" {
+					seed = auth.EnsureIndex()
+				}
+				if lane := config.SelectAutomaticSourceIPLane(cfg.ProxyPool, seed); lane != nil {
+					proxyID = lane.ID
+				}
+			}
 		}
 		proxyURL = cfg.ResolveProxyURL(proxyID, fallbackURL)
 	} else if auth != nil {

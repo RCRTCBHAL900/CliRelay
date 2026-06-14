@@ -3,6 +3,8 @@ package config
 import (
 	"bytes"
 	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -181,6 +183,40 @@ func RealizeProxyPoolEntries(entries []ProxyPoolEntry) []ProxyPoolEntry {
 	}
 
 	return out
+}
+
+// SelectAutomaticSourceIPLane returns a deterministic automatic Claude lane for the given seed.
+func SelectAutomaticSourceIPLane(entries []ProxyPoolEntry, seed string) *ProxyPoolEntry {
+	realizedEntries := RealizeProxyPoolEntries(entries)
+	lanes := make([]ProxyPoolEntry, 0, len(realizedEntries))
+	for _, entry := range realizedEntries {
+		if !entry.Enabled || strings.TrimSpace(entry.SourceIP) == "" {
+			continue
+		}
+		if !strings.HasPrefix(normalizeProxyID(entry.ID), "claude-lane-") {
+			continue
+		}
+		lanes = append(lanes, entry)
+	}
+	if len(lanes) == 0 {
+		return nil
+	}
+	sort.Slice(lanes, func(i, j int) bool {
+		left := normalizeProxyID(lanes[i].ID)
+		right := normalizeProxyID(lanes[j].ID)
+		if left != right {
+			return left < right
+		}
+		return lanes[i].Name < lanes[j].Name
+	})
+	trimmedSeed := strings.TrimSpace(seed)
+	if trimmedSeed == "" {
+		trimmedSeed = "default"
+	}
+	sum := sha256.Sum256([]byte(trimmedSeed))
+	index := int(binary.BigEndian.Uint64(sum[:8]) % uint64(len(lanes)))
+	entry := lanes[index]
+	return &entry
 }
 
 // ResolveProxyURLFromEntries returns the effective proxy URL for a proxy-id using the provided entries.
