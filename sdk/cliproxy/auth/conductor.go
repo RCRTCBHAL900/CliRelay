@@ -526,9 +526,18 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	m.mu.Lock()
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	existing := make([]*Auth, 0, len(m.auths))
+	for _, current := range m.auths {
+		if current != nil {
+			existing = append(existing, current)
+		}
+	}
+	assignAutomaticClaudeProxy(cfg, auth, existing)
+	hydrateLoadedAuthState(auth, time.Now())
 	auth.EnsureIndex()
 	snapshot := auth.Clone()
-	m.mu.Lock()
 	snapshot.CurrentInFlight = 0
 	snapshot.ConsecutiveFailures = 0
 	snapshot.LastFailureStatus = 0
@@ -553,6 +562,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	var previous *Auth
 	m.mu.Lock()
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if existing, ok := m.auths[auth.ID]; ok && existing != nil && !auth.indexAssigned && auth.Index == "" {
 		auth.Index = existing.Index
 		auth.indexAssigned = existing.indexAssigned
@@ -560,6 +570,14 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
 		previous = existing.Clone()
 	}
+	existing := make([]*Auth, 0, len(m.auths))
+	for _, current := range m.auths {
+		if current != nil {
+			existing = append(existing, current)
+		}
+	}
+	assignAutomaticClaudeProxy(cfg, auth, existing)
+	hydrateLoadedAuthState(auth, time.Now())
 	auth.EnsureIndex()
 	snapshot := auth.Clone()
 	if previous != nil {
@@ -603,11 +621,13 @@ func (m *Manager) Load(ctx context.Context) error {
 	}
 	updatedAuths := normalizeLoadedClaudeProxyAssignments(cfg, items)
 	m.auths = make(map[string]*Auth, len(items))
+	now := time.Now()
 	for _, auth := range items {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
 		auth.EnsureIndex()
+		hydrateLoadedAuthState(auth, now)
 		auth.CurrentInFlight = 0
 		auth.ConsecutiveFailures = 0
 		auth.LastFailureStatus = 0
@@ -619,6 +639,82 @@ func (m *Manager) Load(ctx context.Context) error {
 		_ = m.persist(ctx, auth)
 	}
 	return nil
+}
+
+func hydrateLoadedAuthState(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	if auth.LastRefreshedAt.IsZero() {
+		if ts, ok := authLastRefreshTimestamp(auth); ok {
+			auth.LastRefreshedAt = ts
+		}
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+		return
+	}
+	if !claudeAuthCarriesManagedCredentials(auth) {
+		return
+	}
+
+	accessToken := ""
+	refreshToken := ""
+	if auth.Metadata != nil {
+		if raw, ok := auth.Metadata["access_token"].(string); ok {
+			accessToken = strings.TrimSpace(raw)
+		}
+		if raw, ok := auth.Metadata["refresh_token"].(string); ok {
+			refreshToken = strings.TrimSpace(raw)
+		}
+	}
+
+	quarantineUntil := time.Time{}
+	statusMessage := ""
+	switch {
+	case accessToken == "" && refreshToken == "":
+		quarantineUntil = now.Add(24 * time.Hour)
+		statusMessage = "missing credentials"
+	case accessToken == "" && refreshToken != "":
+		quarantineUntil = now.Add(refreshPendingBackoff)
+		statusMessage = "refresh pending"
+	default:
+		if expiry, ok := auth.ExpirationTime(); ok && !expiry.IsZero() && !expiry.After(now) {
+			quarantineUntil = now.Add(refreshPendingBackoff)
+			statusMessage = "refresh pending"
+		}
+	}
+
+	if quarantineUntil.IsZero() {
+		return
+	}
+	if auth.Status == StatusDisabled || auth.Disabled {
+		return
+	}
+	auth.Status = StatusError
+	auth.Unavailable = true
+	auth.StatusMessage = statusMessage
+	auth.NextRetryAfter = quarantineUntil
+}
+
+func claudeAuthCarriesManagedCredentials(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if len(auth.Attributes) > 0 && strings.TrimSpace(auth.Attributes["api_key"]) != "" {
+		return false
+	}
+	if strings.TrimSpace(auth.FileName) != "" {
+		return true
+	}
+	if len(auth.Metadata) == 0 {
+		return false
+	}
+	for _, key := range []string{"type", "provider", "email", "access_token", "refresh_token", "expired", "cookies", "session"} {
+		if _, ok := auth.Metadata[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Execute performs a non-streaming execution using the configured selector and executor.
@@ -2761,6 +2857,10 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		}
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
+			current.Status = StatusError
+			current.Unavailable = true
+			current.StatusMessage = err.Error()
+			current.NextRetryAfter = now.Add(refreshFailureBackoff)
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			current.LastError = &Error{Message: err.Error()}
 			m.auths[id] = current
@@ -2776,11 +2876,30 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if updated.Runtime == nil {
 		updated.Runtime = auth.Runtime
 	}
+	clearRefreshRecoveryState(updated, now)
 	updated.LastRefreshedAt = now
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
 	updated.UpdatedAt = now
 	_, _ = m.Update(ctx, updated)
+}
+
+func clearRefreshRecoveryState(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.Unavailable = false
+	auth.NextRetryAfter = time.Time{}
+	auth.StatusMessage = ""
+	auth.LastError = nil
+	if len(auth.ModelStates) > 0 {
+		updateAggregatedAvailability(auth, now)
+		if !hasModelError(auth, now) {
+			auth.Status = StatusActive
+		}
+		return
+	}
+	auth.Status = StatusActive
 }
 
 func (m *Manager) releaseAuthLease(authID string) {

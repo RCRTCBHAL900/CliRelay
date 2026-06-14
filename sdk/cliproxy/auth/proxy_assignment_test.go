@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
@@ -56,5 +58,83 @@ func TestNormalizeLoadedClaudeProxyAssignmentsSkipsWhenPoolEmpty(t *testing.T) {
 	}
 	if items[0].ProxyID != "" || items[0].ProxyURL != "" {
 		t.Fatalf("unexpected assignment: %#v", items[0])
+	}
+}
+
+func TestManagerRegisterAutoAssignsClaudeSourceIPLane(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		ProxyPool: []internalconfig.ProxyPoolEntry{
+			{ID: "lane-a", Name: "Lane A", SourceIP: "127.0.0.1", Enabled: true},
+			{ID: "lane-b", Name: "Lane B", SourceIP: "127.0.0.2", Enabled: true},
+		},
+	})
+
+	if _, err := manager.Register(context.Background(), &Auth{
+		ID:       "existing",
+		Provider: "claude",
+		ProxyID:  "lane-a",
+		ProxyURL: "sourceip://127.0.0.1",
+		Metadata: map[string]any{"proxy_id": "lane-a", "proxy_url": "sourceip://127.0.0.1"},
+	}); err != nil {
+		t.Fatalf("Register existing: %v", err)
+	}
+
+	registered, err := manager.Register(context.Background(), &Auth{
+		ID:       "new",
+		Provider: "claude",
+		Metadata: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("Register new: %v", err)
+	}
+
+	if registered.ProxyID != "lane-b" {
+		t.Fatalf("ProxyID = %q, want lane-b", registered.ProxyID)
+	}
+	if registered.ProxyURL != "sourceip://127.0.0.2" {
+		t.Fatalf("ProxyURL = %q, want sourceip://127.0.0.2", registered.ProxyURL)
+	}
+	if got, _ := registered.Metadata["proxy_id"].(string); got != "lane-b" {
+		t.Fatalf("metadata proxy_id = %#v, want lane-b", registered.Metadata["proxy_id"])
+	}
+	if got, _ := registered.Metadata["proxy_url"].(string); got != "sourceip://127.0.0.2" {
+		t.Fatalf("metadata proxy_url = %#v, want sourceip://127.0.0.2", registered.Metadata["proxy_url"])
+	}
+}
+
+func TestManagerRegisterImmediatelyQuarantinesExpiredClaudeToken(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, nil, nil)
+	expired := time.Now().Add(-time.Minute).Format(time.RFC3339)
+
+	registered, err := manager.Register(context.Background(), &Auth{
+		ID:       "expired",
+		Provider: "claude",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"access_token":  "tok",
+			"refresh_token": "refresh",
+			"expired":       expired,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Register expired: %v", err)
+	}
+
+	if registered.Status != StatusError {
+		t.Fatalf("Status = %q, want %q", registered.Status, StatusError)
+	}
+	if !registered.Unavailable {
+		t.Fatal("Unavailable = false, want true")
+	}
+	if registered.StatusMessage != "refresh pending" {
+		t.Fatalf("StatusMessage = %q, want refresh pending", registered.StatusMessage)
+	}
+	if registered.NextRetryAfter.IsZero() {
+		t.Fatal("NextRetryAfter = zero, want future time")
 	}
 }

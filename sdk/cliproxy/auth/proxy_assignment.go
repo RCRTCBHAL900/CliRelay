@@ -7,6 +7,36 @@ import (
 	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 )
 
+func assignAutomaticClaudeProxy(cfg *internalconfig.Config, auth *Auth, existing []*Auth) bool {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+		return false
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+
+	pool := listEnabledProxyPoolEntries(cfg)
+	changed := false
+	if len(pool) > 0 {
+		if matched := matchProxyPoolEntryForAuth(pool, auth); matched != nil {
+			if applyProxyEntryToAuth(auth, *matched) {
+				changed = true
+			}
+		} else if strings.TrimSpace(auth.ProxyID) == "" && strings.TrimSpace(auth.ProxyURL) == "" {
+			if assigned := selectAutomaticClaudeProxyEntry(pool, auth.ID, existing); assigned != nil {
+				if applyProxyEntryToAuth(auth, *assigned) {
+					changed = true
+				}
+			}
+		}
+	}
+
+	if syncClaudeProxyMetadata(auth) {
+		changed = true
+	}
+	return changed
+}
+
 func normalizeLoadedClaudeProxyAssignments(cfg *internalconfig.Config, items []*Auth) []*Auth {
 	if len(items) == 0 {
 		return nil
@@ -137,4 +167,96 @@ func normalizeProxyAssignmentID(raw string) string {
 		}
 	}
 	return strings.Trim(b.String(), "-")
+}
+
+func selectAutomaticClaudeProxyEntry(pool []internalconfig.ProxyPoolEntry, authID string, existing []*Auth) *internalconfig.ProxyPoolEntry {
+	if len(pool) == 0 {
+		return nil
+	}
+	assignments := make(map[string]int, len(pool))
+	for _, entry := range pool {
+		if key := proxyPoolAssignmentKey(entry); key != "" {
+			assignments[key] = 0
+		}
+	}
+	for _, existingAuth := range existing {
+		if existingAuth == nil || existingAuth.ID == authID {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(existingAuth.Provider), "claude") {
+			continue
+		}
+		if key := assignedAuthProxyKey(existingAuth); key != "" {
+			if _, ok := assignments[key]; ok {
+				assignments[key]++
+			}
+		}
+	}
+
+	bestIndex := -1
+	bestCount := int(^uint(0) >> 1)
+	for idx, entry := range pool {
+		count := assignments[proxyPoolAssignmentKey(entry)]
+		if bestIndex == -1 || count < bestCount {
+			bestIndex = idx
+			bestCount = count
+		}
+	}
+	if bestIndex < 0 {
+		return nil
+	}
+	entry := pool[bestIndex]
+	return &entry
+}
+
+func matchProxyPoolEntryForAuth(pool []internalconfig.ProxyPoolEntry, auth *Auth) *internalconfig.ProxyPoolEntry {
+	if auth == nil || len(pool) == 0 {
+		return nil
+	}
+	authKey := assignedAuthProxyKey(auth)
+	if authKey == "" {
+		return nil
+	}
+	for idx, entry := range pool {
+		if proxyPoolAssignmentKey(entry) == authKey {
+			return &pool[idx]
+		}
+	}
+	return nil
+}
+
+func applyProxyEntryToAuth(auth *Auth, entry internalconfig.ProxyPoolEntry) bool {
+	if auth == nil {
+		return false
+	}
+	changed := false
+	if proxyID := strings.TrimSpace(entry.ID); proxyID != "" && strings.TrimSpace(auth.ProxyID) != proxyID {
+		auth.ProxyID = proxyID
+		changed = true
+	}
+	if proxyURL := resolveProxyEntryURL(entry); proxyURL != "" && strings.TrimSpace(auth.ProxyURL) != proxyURL {
+		auth.ProxyURL = proxyURL
+		changed = true
+	}
+	return changed
+}
+
+func syncClaudeProxyMetadata(auth *Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	changed := false
+	if proxyID := strings.TrimSpace(auth.ProxyID); proxyID != "" {
+		if current, _ := auth.Metadata["proxy_id"].(string); strings.TrimSpace(current) != proxyID {
+			auth.Metadata["proxy_id"] = proxyID
+			changed = true
+		}
+	}
+	if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+		if current, _ := auth.Metadata["proxy_url"].(string); strings.TrimSpace(current) != proxyURL {
+			auth.Metadata["proxy_url"] = proxyURL
+			changed = true
+		}
+	}
+	return changed
 }

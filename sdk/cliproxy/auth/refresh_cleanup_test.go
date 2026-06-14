@@ -147,9 +147,13 @@ func TestRefreshAuth_Success_UpdatesCredential(t *testing.T) {
 	mgr := NewManager(store, nil, nil)
 
 	auth := &Auth{
-		ID:       "test-auth-3",
-		Provider: "test-provider",
-		Metadata: map[string]any{"type": "codex"},
+		ID:             "test-auth-3",
+		Provider:       "test-provider",
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: time.Now().Add(10 * time.Minute),
+		StatusMessage:  "refresh pending",
+		Metadata:       map[string]any{"type": "codex"},
 	}
 
 	ctx := WithSkipPersist(context.Background())
@@ -172,6 +176,15 @@ func TestRefreshAuth_Success_UpdatesCredential(t *testing.T) {
 	if current.LastError != nil {
 		t.Fatal("expected LastError to be nil after successful refresh")
 	}
+	if current.Status != StatusActive {
+		t.Fatalf("expected StatusActive after successful refresh, got %q", current.Status)
+	}
+	if current.Unavailable {
+		t.Fatal("expected auth to be available after successful refresh")
+	}
+	if !current.NextRetryAfter.IsZero() {
+		t.Fatalf("expected NextRetryAfter to be cleared after successful refresh, got %v", current.NextRetryAfter)
+	}
 	if !current.LastRefreshedAt.After(time.Time{}) {
 		t.Fatal("expected LastRefreshedAt to be set after successful refresh")
 	}
@@ -184,6 +197,68 @@ func TestRefreshAuth_Success_UpdatesCredential(t *testing.T) {
 	// Store.Save should have been called (for the Update).
 	if got := store.saveCount.Load(); got < 1 {
 		t.Fatalf("expected at least 1 Save call for update, got %d", got)
+	}
+}
+
+func TestHydrateLoadedAuthState_ClaudeExpiredTokenQuarantined(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	auth := &Auth{
+		ID:       "claude-expired",
+		Provider: "claude",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"access_token":  "tok",
+			"refresh_token": "refresh",
+			"expired":       now.Add(-time.Minute).Format(time.RFC3339),
+		},
+	}
+
+	hydrateLoadedAuthState(auth, now)
+
+	if auth.Status != StatusError {
+		t.Fatalf("Status = %q, want %q", auth.Status, StatusError)
+	}
+	if !auth.Unavailable {
+		t.Fatal("Unavailable = false, want true")
+	}
+	if auth.StatusMessage != "refresh pending" {
+		t.Fatalf("StatusMessage = %q, want refresh pending", auth.StatusMessage)
+	}
+	if auth.NextRetryAfter.IsZero() || auth.NextRetryAfter.Before(now) {
+		t.Fatalf("NextRetryAfter = %v, want future time", auth.NextRetryAfter)
+	}
+}
+
+func TestHydrateLoadedAuthState_ClaudeMissingCredentialsQuarantined(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	auth := &Auth{
+		ID:       "claude-missing",
+		Provider: "claude",
+		FileName: "claude-missing.json",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"type":  "claude",
+			"email": "missing@example.com",
+		},
+	}
+
+	hydrateLoadedAuthState(auth, now)
+
+	if auth.Status != StatusError {
+		t.Fatalf("Status = %q, want %q", auth.Status, StatusError)
+	}
+	if !auth.Unavailable {
+		t.Fatal("Unavailable = false, want true")
+	}
+	if auth.StatusMessage != "missing credentials" {
+		t.Fatalf("StatusMessage = %q, want missing credentials", auth.StatusMessage)
+	}
+	if auth.NextRetryAfter.IsZero() || auth.NextRetryAfter.Sub(now) < 23*time.Hour {
+		t.Fatalf("NextRetryAfter = %v, want long quarantine", auth.NextRetryAfter)
 	}
 }
 

@@ -26,6 +26,7 @@ var (
 type oauthSession struct {
 	Provider  string
 	Status    string
+	Metadata  map[string]string
 	CreatedAt time.Time
 	ExpiresAt time.Time
 }
@@ -54,7 +55,26 @@ func (s *oauthSessionStore) purgeExpiredLocked(now time.Time) {
 	}
 }
 
-func (s *oauthSessionStore) Register(state, provider string) {
+func copyOAuthSessionMetadata(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (s *oauthSessionStore) Register(state, provider string, metadata map[string]string) {
 	state = strings.TrimSpace(state)
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	if state == "" || provider == "" {
@@ -69,6 +89,7 @@ func (s *oauthSessionStore) Register(state, provider string) {
 	s.sessions[state] = oauthSession{
 		Provider:  provider,
 		Status:    "",
+		Metadata:  copyOAuthSessionMetadata(metadata),
 		CreatedAt: now,
 		ExpiresAt: now.Add(s.ttl),
 	}
@@ -151,7 +172,28 @@ func (s *oauthSessionStore) Get(state string) (oauthSession, bool) {
 
 	s.purgeExpiredLocked(now)
 	session, ok := s.sessions[state]
+	session.Metadata = copyOAuthSessionMetadata(session.Metadata)
 	return session, ok
+}
+
+func (s *oauthSessionStore) List(provider string) []oauthSession {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.purgeExpiredLocked(now)
+	out := make([]oauthSession, 0, len(s.sessions))
+	for _, session := range s.sessions {
+		if provider != "" && !strings.EqualFold(session.Provider, provider) {
+			continue
+		}
+		cloned := session
+		cloned.Metadata = copyOAuthSessionMetadata(session.Metadata)
+		out = append(out, cloned)
+	}
+	return out
 }
 
 func (s *oauthSessionStore) IsPending(state, provider string) bool {
@@ -178,7 +220,11 @@ func (s *oauthSessionStore) IsPending(state, provider string) bool {
 
 var oauthSessions = newOAuthSessionStore(oauthSessionTTL)
 
-func RegisterOAuthSession(state, provider string) { oauthSessions.Register(state, provider) }
+func RegisterOAuthSession(state, provider string) { oauthSessions.Register(state, provider, nil) }
+
+func RegisterOAuthSessionWithMetadata(state, provider string, metadata map[string]string) {
+	oauthSessions.Register(state, provider, metadata)
+}
 
 func SetOAuthSessionError(state, message string) { oauthSessions.SetError(state, message) }
 
@@ -194,6 +240,10 @@ func GetOAuthSession(state string) (provider string, status string, ok bool) {
 		return "", "", false
 	}
 	return session.Provider, session.Status, true
+}
+
+func ListOAuthSessions(provider string) []oauthSession {
+	return oauthSessions.List(provider)
 }
 
 func IsOAuthSessionPending(state, provider string) bool {

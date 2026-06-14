@@ -1561,6 +1561,18 @@ func (h *Handler) selectAutomaticProxyEntry(provider string, authID string) *con
 			}
 		}
 	}
+	for _, session := range ListOAuthSessions("") {
+		if !oauthSessionMatchesAuthProvider(session.Provider, provider) {
+			continue
+		}
+		assignmentKey := assignedSessionProxyKey(session)
+		if assignmentKey == "" {
+			continue
+		}
+		if _, ok := assignments[assignmentKey]; ok {
+			assignments[assignmentKey]++
+		}
+	}
 
 	bestIndex := -1
 	bestCount := int(^uint(0) >> 1)
@@ -1729,6 +1741,31 @@ func (h *Handler) listObservedProxyEntries(provider string, authID string) []con
 	return out
 }
 
+func oauthSessionMatchesAuthProvider(sessionProvider string, authProvider string) bool {
+	sessionProvider = strings.ToLower(strings.TrimSpace(sessionProvider))
+	authProvider = strings.ToLower(strings.TrimSpace(authProvider))
+	switch authProvider {
+	case "", sessionProvider:
+		return true
+	case "claude":
+		return sessionProvider == "claude" || sessionProvider == "anthropic"
+	case "anthropic":
+		return sessionProvider == "claude" || sessionProvider == "anthropic"
+	default:
+		return false
+	}
+}
+
+func assignedSessionProxyKey(session oauthSession) string {
+	if key := normalizeProxyPoolSelectionID(session.Metadata["proxy_url"]); key != "" {
+		return key
+	}
+	if key := normalizeProxyPoolSelectionID(session.Metadata["proxy_id"]); key != "" {
+		return key
+	}
+	return ""
+}
+
 func normalizeProxyPoolSelectionID(raw string) string {
 	trimmed := strings.ToLower(strings.TrimSpace(raw))
 	if trimmed == "" {
@@ -1821,6 +1858,23 @@ func sourceIPFromProxyURL(raw string) (string, bool) {
 		return "", false
 	}
 	return sourceIP, true
+}
+
+func oauthSessionProxyMetadata(entry *config.ProxyPoolEntry) map[string]string {
+	if entry == nil {
+		return nil
+	}
+	metadata := make(map[string]string)
+	if proxyID := strings.TrimSpace(entry.ID); proxyID != "" {
+		metadata["proxy_id"] = proxyID
+	}
+	if proxyURL := resolveAutomaticProxyURL(*entry); proxyURL != "" {
+		metadata["proxy_url"] = proxyURL
+	}
+	if len(metadata) == 0 {
+		return nil
+	}
+	return metadata
 }
 
 // PatchAuthFileStatus toggles the disabled state of an auth file
@@ -2295,8 +2349,17 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		return
 	}
 
+	selectedProxy := h.selectAutomaticProxyEntry("claude", "oauth:"+state)
+	selectedProxyMetadata := oauthSessionProxyMetadata(selectedProxy)
+	anthropicSDKConfig := h.cfg.SDKConfig
+	if selectedProxy != nil {
+		if proxyURL := resolveAutomaticProxyURL(*selectedProxy); proxyURL != "" {
+			anthropicSDKConfig.ProxyURL = proxyURL
+		}
+	}
+
 	// Initialize Claude auth service
-	anthropicAuth := claude.NewClaudeAuth(h.cfg)
+	anthropicAuth := claude.NewClaudeAuthWithSDKConfig(&anthropicSDKConfig)
 
 	isWebUI := isWebUIRequest(c)
 	redirectURI := claude.RedirectURI
@@ -2328,7 +2391,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		return
 	}
 
-	RegisterOAuthSession(state, "anthropic")
+	RegisterOAuthSessionWithMetadata(state, "anthropic", selectedProxyMetadata)
 
 	go func() {
 		if forwarder != nil {
@@ -2403,6 +2466,14 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
 			Storage:  tokenStorage,
 			Metadata: claudeOAuthMetadataFromTokenStorage(tokenStorage),
+		}
+		if selectedProxy != nil {
+			if proxyID := strings.TrimSpace(selectedProxy.ID); proxyID != "" {
+				record.ProxyID = proxyID
+			}
+			if proxyURL := resolveAutomaticProxyURL(*selectedProxy); proxyURL != "" {
+				record.ProxyURL = proxyURL
+			}
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {

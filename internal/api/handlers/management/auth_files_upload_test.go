@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/bodyutil"
@@ -260,6 +261,38 @@ func TestRegisterAuthFromFileFallsBackToObservedClaudeLanes(t *testing.T) {
 	}
 }
 
+func TestSelectAutomaticProxyEntryCountsPendingClaudeOAuthReservations(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousStore := oauthSessions
+	oauthSessions = newOAuthSessionStore(time.Minute)
+	t.Cleanup(func() {
+		oauthSessions = previousStore
+	})
+
+	h := &Handler{
+		cfg: &config.Config{
+			ProxyPool: []config.ProxyPoolEntry{
+				{ID: "lane-a", Name: "Lane A", SourceIP: "152.89.86.108", Enabled: true},
+				{ID: "lane-b", Name: "Lane B", SourceIP: "152.89.86.109", Enabled: true},
+			},
+		},
+	}
+
+	RegisterOAuthSessionWithMetadata("pending-claude", "anthropic", map[string]string{
+		"proxy_id":  "lane-a",
+		"proxy_url": "sourceip://152.89.86.108",
+	})
+
+	assigned := h.selectAutomaticProxyEntry("claude", "new-auth")
+	if assigned == nil {
+		t.Fatal("expected proxy assignment")
+	}
+	if assigned.ID != "lane-b" {
+		t.Fatalf("assigned.ID = %q, want lane-b", assigned.ID)
+	}
+}
+
 func TestSaveTokenRecordAutoAssignsClaudeSourceIPLane(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -287,7 +320,7 @@ func TestSaveTokenRecordAutoAssignsClaudeSourceIPLane(t *testing.T) {
 			"proxy_id":  "lane-a",
 			"proxy_url": "sourceip://152.89.86.108",
 		},
-		}); err != nil {
+	}); err != nil {
 		t.Fatalf("register existing auth: %v", err)
 	}
 
