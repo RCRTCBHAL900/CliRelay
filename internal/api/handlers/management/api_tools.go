@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -223,6 +224,7 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
+	h.reconcileAPICallAuthResult(c.Request.Context(), auth, method, parsedURL, body.Data, resp.StatusCode, resp.Header)
 	if errReconcile := h.reconcileCodexWhamUsagePlan(c.Request.Context(), auth, parsedURL, resp.StatusCode, respBody); errReconcile != nil {
 		log.WithError(errReconcile).Warn("failed to reconcile codex usage plan type")
 	}
@@ -244,6 +246,114 @@ func firstNonEmptyString(values ...*string) string {
 		}
 	}
 	return ""
+}
+
+func (h *Handler) reconcileAPICallAuthResult(ctx context.Context, auth *coreauth.Auth, method string, parsedURL *url.URL, requestBody string, statusCode int, headers http.Header) {
+	if h == nil || h.authManager == nil || auth == nil {
+		return
+	}
+	result, ok := buildAPICallAuthResult(auth, method, parsedURL, requestBody, statusCode, headers)
+	if !ok {
+		return
+	}
+	h.authManager.MarkResult(ctx, result)
+}
+
+func buildAPICallAuthResult(auth *coreauth.Auth, method string, parsedURL *url.URL, requestBody string, statusCode int, headers http.Header) (coreauth.Result, bool) {
+	if auth == nil {
+		return coreauth.Result{}, false
+	}
+
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	switch provider {
+	case "claude", "anthropic":
+		if !isClaudeMessagesInferenceURL(method, parsedURL) {
+			return coreauth.Result{}, false
+		}
+
+		result := coreauth.Result{
+			AuthID:   auth.ID,
+			Provider: auth.Provider,
+			Model:    apiCallRequestModel(requestBody),
+			Success:  statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices,
+		}
+		if result.Success {
+			return result, true
+		}
+
+		result.Error = &coreauth.Error{
+			Code:       fmt.Sprintf("http_%d", statusCode),
+			Message:    apiCallStatusMessage(statusCode),
+			Retryable:  statusCode == http.StatusRequestTimeout || statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError,
+			HTTPStatus: statusCode,
+		}
+		if retryAfter := parseRetryAfterHeader(headers.Get("Retry-After")); retryAfter != nil {
+			result.RetryAfter = retryAfter
+		}
+		return result, true
+	default:
+		return coreauth.Result{}, false
+	}
+}
+
+func isClaudeMessagesInferenceURL(method string, parsedURL *url.URL) bool {
+	if parsedURL == nil || !strings.EqualFold(strings.TrimSpace(method), http.MethodPost) {
+		return false
+	}
+	path := strings.TrimRight(parsedURL.EscapedPath(), "/")
+	return path == "/v1/messages"
+}
+
+func apiCallRequestModel(requestBody string) string {
+	requestBody = strings.TrimSpace(requestBody)
+	if requestBody == "" {
+		return ""
+	}
+	var payload struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal([]byte(requestBody), &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Model)
+}
+
+func apiCallStatusMessage(statusCode int) string {
+	switch statusCode {
+	case http.StatusUnauthorized:
+		return "unauthorized"
+	case http.StatusPaymentRequired:
+		return "payment required"
+	case http.StatusForbidden:
+		return "forbidden"
+	case http.StatusNotFound:
+		return "not found"
+	case http.StatusRequestTimeout:
+		return "request timeout"
+	case http.StatusTooManyRequests:
+		return "quota exhausted"
+	}
+	if text := strings.TrimSpace(http.StatusText(statusCode)); text != "" {
+		return strings.ToLower(text)
+	}
+	return "upstream error"
+}
+
+func parseRetryAfterHeader(raw string) *time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		d := time.Duration(seconds) * time.Second
+		return &d
+	}
+	if when, err := http.ParseTime(raw); err == nil {
+		if d := time.Until(when); d > 0 {
+			return &d
+		}
+	}
+	return nil
 }
 
 func (h *Handler) reconcileCodexWhamUsagePlan(ctx context.Context, auth *coreauth.Auth, parsedURL *url.URL, statusCode int, respBody []byte) error {

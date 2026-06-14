@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"io"
 	"net/http"
@@ -206,5 +208,46 @@ func TestOpenCodeGoExecutorSupportsAnthropicMessagesAPIForOpenAIModels(t *testin
 	}
 	if gotText := gjson.GetBytes(resp.Payload, "content.0.text").String(); gotText != "anthropic ok" {
 		t.Fatalf("anthropic response text = %q, want anthropic ok; payload=%s", gotText, string(resp.Payload))
+	}
+}
+
+func TestOpenCodeGoExecutorDecodesGzippedMessagesResponseWithoutEncodingHeader(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		payload := []byte(`{"id":"msg_gzip","type":"message","role":"assistant","model":"minimax-m2.7","content":[{"type":"text","text":"decoded ok"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}`)
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, err := zw.Write(payload); err != nil {
+			t.Fatalf("gzip write: %v", err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("gzip close: %v", err)
+		}
+		_, _ = w.Write(buf.Bytes())
+	}))
+	defer server.Close()
+
+	oldBaseURL := opencodeGoBaseURL
+	opencodeGoBaseURL = server.URL + "/zen/go/v1"
+	t.Cleanup(func() { opencodeGoBaseURL = oldBaseURL })
+
+	exec := NewOpenCodeGoExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test-key"}}
+	payload := []byte(`{"model":"minimax-m2.7","messages":[{"role":"user","content":"hi"}]}`)
+	resp, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "minimax-m2.7",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI})
+	if err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	if gotPath != "/zen/go/v1/messages" {
+		t.Fatalf("path = %q, want /zen/go/v1/messages", gotPath)
+	}
+	if gotText := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); gotText != "decoded ok" {
+		t.Fatalf("response text = %q, want decoded ok; payload=%s", gotText, string(resp.Payload))
 	}
 }

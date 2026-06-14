@@ -144,19 +144,25 @@ func (e *OpenCodeGoExecutor) executeMessages(ctx context.Context, auth *cliproxy
 		reporter.publishFailureWithContent(ctx, string(req.Payload), err.Error())
 		return resp, err
 	}
+	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
+	if err != nil {
+		recordAPIResponseError(ctx, e.cfg, err)
+		reporter.publishFailureWithContent(ctx, string(req.Payload), err.Error())
+		return resp, err
+	}
 	defer func() {
-		if errClose := httpResp.Body.Close(); errClose != nil {
+		if errClose := decodedBody.Close(); errClose != nil {
 			log.Errorf("opencode go executor: close response body error: %v", errClose)
 		}
 	}()
-	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b := readUpstreamErrorBody(e.Identifier(), httpResp.Body)
+		b := readUpstreamErrorBody(e.Identifier(), decodedBody)
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		reporter.publishFailureWithContent(ctx, string(req.Payload), string(b))
 		return resp, statusErr{code: httpResp.StatusCode, msg: string(b)}
 	}
-	data, err := readUpstreamResponseBody(e.Identifier(), httpResp.Body)
+	data, err := readUpstreamResponseBody(e.Identifier(), decodedBody)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -220,11 +226,17 @@ func (e *OpenCodeGoExecutor) executeMessagesStream(ctx context.Context, auth *cl
 		return nil, err
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
+	if err != nil {
+		recordAPIResponseError(ctx, e.cfg, err)
+		reporter.publishFailureWithContent(ctx, string(req.Payload), err.Error())
+		return nil, err
+	}
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b := readUpstreamErrorBody(e.Identifier(), httpResp.Body)
+		b := readUpstreamErrorBody(e.Identifier(), decodedBody)
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		reporter.publishFailureWithContent(ctx, string(req.Payload), string(b))
-		if errClose := httpResp.Body.Close(); errClose != nil {
+		if errClose := decodedBody.Close(); errClose != nil {
 			log.Errorf("opencode go executor: close response body error: %v", errClose)
 		}
 		return nil, statusErr{code: httpResp.StatusCode, msg: string(b)}
@@ -235,11 +247,11 @@ func (e *OpenCodeGoExecutor) executeMessagesStream(ctx context.Context, auth *cl
 	go func() {
 		defer close(out)
 		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
+			if errClose := decodedBody.Close(); errClose != nil {
 				log.Errorf("opencode go executor: close response body error: %v", errClose)
 			}
 		}()
-		scanner := bufio.NewScanner(httpResp.Body)
+		scanner := bufio.NewScanner(decodedBody)
 		scanner.Buffer(nil, 52_428_800)
 		var param any
 		for scanner.Scan() {

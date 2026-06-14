@@ -497,3 +497,193 @@ func TestAPICallRejectsOversizedUpstreamResponse(t *testing.T) {
 		t.Fatalf("expected upstream size error, got body=%s", rec.Body.String())
 	}
 }
+
+func TestAPICallReconcilesClaudeProbeFailureIntoAuthState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer access-token" {
+			t.Fatalf("unexpected authorization header: %q", got)
+		}
+		w.Header().Set("Retry-After", "45")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`<html><body>429 Too Many Requests</body></html>`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "claude-probe.json",
+		FileName: "claude-probe.json",
+		Provider: "claude",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"type":         "claude",
+			"access_token": "access-token",
+			"email":        "probe@example.com",
+		},
+	}
+	registered, err := manager.Register(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	registered.EnsureIndex()
+
+	requestBody, err := json.Marshal(map[string]any{
+		"authIndex": registered.Index,
+		"method":    "POST",
+		"url":       upstream.URL + "/v1/messages",
+		"header": map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+			"Content-Type":  "application/json",
+		},
+		"data": `{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`,
+	})
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+
+	h := &Handler{cfg: &config.Config{}, authManager: manager}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", bytes.NewReader(requestBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.APICall(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d, body=%s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected updated auth")
+	}
+	if updated.Status != coreauth.StatusError {
+		t.Fatalf("status = %q, want %q", updated.Status, coreauth.StatusError)
+	}
+	state := updated.ModelStates["claude-opus-4-8"]
+	if state == nil {
+		t.Fatal("expected model state after failed probe")
+	}
+	if state.Status != coreauth.StatusError {
+		t.Fatalf("model status = %q, want %q", state.Status, coreauth.StatusError)
+	}
+	if state.StatusMessage != "quota exhausted" {
+		t.Fatalf("model status message = %q, want quota exhausted", state.StatusMessage)
+	}
+	if state.NextRetryAfter.IsZero() {
+		t.Fatal("expected NextRetryAfter to be set from Retry-After header")
+	}
+	if wait := time.Until(state.NextRetryAfter); wait < 40*time.Second {
+		t.Fatalf("retry wait = %v, want at least 40s", wait)
+	}
+}
+
+func TestAPICallReconcilesClaudeProbeSuccessClearsStaleState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_123","type":"message","model":"claude-opus-4-8","role":"assistant","content":[{"type":"text","text":"ok"}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	nextRetry := time.Now().Add(10 * time.Minute)
+	auth := &coreauth.Auth{
+		ID:            "claude-stale.json",
+		FileName:      "claude-stale.json",
+		Provider:      "claude",
+		Status:        coreauth.StatusError,
+		StatusMessage: "unauthorized",
+		LastError: &coreauth.Error{
+			Code:       "http_401",
+			Message:    "unauthorized",
+			Retryable:  false,
+			HTTPStatus: http.StatusUnauthorized,
+		},
+		ModelStates: map[string]*coreauth.ModelState{
+			"claude-opus-4-8": {
+				Status:         coreauth.StatusError,
+				StatusMessage:  "unauthorized",
+				Unavailable:    true,
+				NextRetryAfter: nextRetry,
+				LastError: &coreauth.Error{
+					Code:       "http_401",
+					Message:    "unauthorized",
+					Retryable:  false,
+					HTTPStatus: http.StatusUnauthorized,
+				},
+			},
+		},
+		Metadata: map[string]any{
+			"type":         "claude",
+			"access_token": "access-token",
+			"email":        "probe@example.com",
+		},
+	}
+	registered, err := manager.Register(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	registered.EnsureIndex()
+
+	requestBody, err := json.Marshal(map[string]any{
+		"authIndex": registered.Index,
+		"method":    "POST",
+		"url":       upstream.URL + "/v1/messages",
+		"header": map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+			"Content-Type":  "application/json",
+		},
+		"data": `{"model":"claude-opus-4-8","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`,
+	})
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+
+	h := &Handler{cfg: &config.Config{}, authManager: manager}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/api-call", bytes.NewReader(requestBody))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.APICall(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d, body=%s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected updated auth")
+	}
+	if updated.Status != coreauth.StatusActive {
+		t.Fatalf("status = %q, want %q", updated.Status, coreauth.StatusActive)
+	}
+	if updated.StatusMessage != "" {
+		t.Fatalf("status_message = %q, want empty", updated.StatusMessage)
+	}
+	state := updated.ModelStates["claude-opus-4-8"]
+	if state == nil {
+		t.Fatal("expected model state to remain tracked")
+	}
+	if state.Status != coreauth.StatusActive {
+		t.Fatalf("model status = %q, want %q", state.Status, coreauth.StatusActive)
+	}
+	if state.Unavailable {
+		t.Fatal("expected model state to be available after successful probe")
+	}
+	if !state.NextRetryAfter.IsZero() {
+		t.Fatalf("NextRetryAfter = %v, want zero", state.NextRetryAfter)
+	}
+}
