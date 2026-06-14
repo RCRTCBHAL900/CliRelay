@@ -529,7 +529,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	snapshot.LastFailureStatus = 0
 	m.auths[auth.ID] = snapshot
 	m.mu.Unlock()
-	if err := m.persist(ctx, snapshot); err != nil {
+	if err := m.persist(ctx, snapshot.Clone()); err != nil {
 		m.mu.Lock()
 		delete(m.auths, auth.ID)
 		m.mu.Unlock()
@@ -564,7 +564,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	m.auths[auth.ID] = snapshot
 	m.mu.Unlock()
-	if err := m.persist(ctx, snapshot); err != nil {
+	if err := m.persist(ctx, snapshot.Clone()); err != nil {
 		m.mu.Lock()
 		if previous != nil {
 			m.auths[auth.ID] = previous

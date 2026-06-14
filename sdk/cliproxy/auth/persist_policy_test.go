@@ -16,6 +16,8 @@ type snapshotStore struct {
 	observedToken atomic.Value
 }
 
+type mutatingStore struct{}
+
 func (s *countingStore) List(context.Context) ([]*Auth, error) { return nil, nil }
 
 func (s *countingStore) Save(context.Context, *Auth) (string, error) {
@@ -44,6 +46,25 @@ func (s *snapshotStore) Save(_ context.Context, auth *Auth) (string, error) {
 }
 
 func (s *snapshotStore) Delete(context.Context, string) error { return nil }
+
+func (s *mutatingStore) List(context.Context) ([]*Auth, error) { return nil, nil }
+
+func (s *mutatingStore) Save(_ context.Context, auth *Auth) (string, error) {
+	if auth == nil {
+		return "", nil
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = map[string]any{}
+	}
+	auth.Metadata["email"] = "mutated@example.com"
+	if auth.Attributes == nil {
+		auth.Attributes = map[string]string{}
+	}
+	auth.Attributes["api_key"] = "mutated-key"
+	return "", nil
+}
+
+func (s *mutatingStore) Delete(context.Context, string) error { return nil }
 
 func TestWithSkipPersist_DisablesUpdatePersistence(t *testing.T) {
 	store := &countingStore{}
@@ -148,5 +169,56 @@ func TestUpdate_PersistsSnapshotInsteadOfCallerPointer(t *testing.T) {
 
 	if got, _ := store.observedToken.Load().(string); got != "initial" {
 		t.Fatalf("expected persisted token to stay at snapshot value, got %q", got)
+	}
+}
+
+func TestRegister_PersistMutationDoesNotAffectManagerSnapshot(t *testing.T) {
+	store := &mutatingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "auth-1",
+		Provider: "claude",
+		Metadata: map[string]any{"email": "original@example.com"},
+	}
+
+	if _, err := mgr.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	current, ok := mgr.GetByID("auth-1")
+	if !ok || current == nil {
+		t.Fatal("expected auth to be present")
+	}
+	if got, _ := current.Metadata["email"].(string); got != "original@example.com" {
+		t.Fatalf("manager snapshot email = %q, want original@example.com", got)
+	}
+	if got := current.Attributes["api_key"]; got != "" {
+		t.Fatalf("manager snapshot api_key = %q, want empty", got)
+	}
+}
+
+func TestUpdate_PersistMutationDoesNotAffectManagerSnapshot(t *testing.T) {
+	store := &mutatingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "auth-1",
+		Provider: "claude",
+		Metadata: map[string]any{"email": "original@example.com"},
+	}
+
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	if _, err := mgr.Update(context.Background(), auth); err != nil {
+		t.Fatalf("Update returned error: %v", err)
+	}
+	current, ok := mgr.GetByID("auth-1")
+	if !ok || current == nil {
+		t.Fatal("expected auth to be present")
+	}
+	if got, _ := current.Metadata["email"].(string); got != "original@example.com" {
+		t.Fatalf("manager snapshot email = %q, want original@example.com", got)
+	}
+	if got := current.Attributes["api_key"]; got != "" {
+		t.Fatalf("manager snapshot api_key = %q, want empty", got)
 	}
 }
