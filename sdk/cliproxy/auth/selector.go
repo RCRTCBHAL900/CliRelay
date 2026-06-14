@@ -25,6 +25,7 @@ type RoundRobinSelector struct {
 	mu       sync.Mutex
 	cursors  map[string]int
 	weighted map[string]*weightedCursorState
+	affinity map[string]string
 	maxKeys  int
 }
 
@@ -760,6 +761,10 @@ func weightedSelectionKey(provider, model string, opts cliproxyexecutor.Options)
 	return provider + ":" + canonicalModelKey(model) + ":" + weightedSelectionScope(opts.Metadata)
 }
 
+func affinitySelectionKey(provider, model, affinity string) string {
+	return strings.TrimSpace(strings.ToLower(provider)) + ":" + canonicalModelKey(model) + ":" + strings.TrimSpace(affinity)
+}
+
 func pickWeightedAvailable(states map[string]*weightedCursorState, key string, available []*Auth) *Auth {
 	if len(available) == 0 {
 		return nil
@@ -855,6 +860,107 @@ func pickAffinityAvailable(provider, model, affinity string, available []*Auth) 
 	return available[bestIndex]
 }
 
+func claudeAffinityProvider(provider string, available []*Auth) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "claude" {
+		return provider
+	}
+	if provider != "mixed" {
+		return ""
+	}
+
+	detected := ""
+	for _, auth := range available {
+		if auth == nil {
+			continue
+		}
+		authProvider := strings.ToLower(strings.TrimSpace(auth.Provider))
+		if authProvider == "" {
+			continue
+		}
+		if detected == "" {
+			detected = authProvider
+			continue
+		}
+		if detected != authProvider {
+			return ""
+		}
+	}
+	if detected == "claude" {
+		return detected
+	}
+	return ""
+}
+
+func (s *RoundRobinSelector) ensureAffinityKeyLocked(key string, limit int) {
+	if s.affinity == nil {
+		s.affinity = make(map[string]string)
+	}
+	if _, ok := s.affinity[key]; !ok && len(s.affinity) >= limit {
+		s.affinity = make(map[string]string)
+	}
+}
+
+func (s *RoundRobinSelector) rememberedAffinityAvailableLocked(provider, model, affinity string, available []*Auth) *Auth {
+	if s == nil || len(available) == 0 {
+		return nil
+	}
+	key := affinitySelectionKey(provider, model, affinity)
+	authID := strings.TrimSpace(s.affinity[key])
+	if authID == "" {
+		return nil
+	}
+	for _, auth := range available {
+		if auth == nil {
+			continue
+		}
+		if auth.ID == authID {
+			return auth
+		}
+	}
+	delete(s.affinity, key)
+	return nil
+}
+
+func (s *RoundRobinSelector) RememberAffinitySelection(provider, model, affinity, authID string) {
+	if s == nil {
+		return
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	affinity = strings.TrimSpace(affinity)
+	authID = strings.TrimSpace(authID)
+	if provider != "claude" || affinity == "" || authID == "" {
+		return
+	}
+	limit := s.maxKeys
+	if limit <= 0 {
+		limit = 4096
+	}
+	key := affinitySelectionKey(provider, model, affinity)
+	s.mu.Lock()
+	s.ensureAffinityKeyLocked(key, limit)
+	s.affinity[key] = authID
+	s.mu.Unlock()
+}
+
+func (s *RoundRobinSelector) ForgetAffinitySelection(provider, model, affinity, authID string) {
+	if s == nil {
+		return
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	affinity = strings.TrimSpace(affinity)
+	authID = strings.TrimSpace(authID)
+	if provider != "claude" || affinity == "" {
+		return
+	}
+	key := affinitySelectionKey(provider, model, affinity)
+	s.mu.Lock()
+	if remembered := strings.TrimSpace(s.affinity[key]); remembered != "" && (authID == "" || remembered == authID) {
+		delete(s.affinity, key)
+	}
+	s.mu.Unlock()
+}
+
 // Pick selects the next available auth for the provider in a round-robin manner.
 // For gemini-cli virtual auths (identified by the gemini_virtual_parent attribute),
 // a two-level round-robin is used: first cycling across credential groups (parent
@@ -867,13 +973,18 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	if strings.EqualFold(strings.TrimSpace(provider), "claude") {
+	if affinityProvider := claudeAffinityProvider(provider, available); affinityProvider == "claude" {
 		if affinity := authSelectionAffinity(opts.Metadata); affinity != "" {
 			available, err = filterAvailableByLoadCeiling(available, provider, model)
 			if err != nil {
 				return nil, err
 			}
-			selected := pickAffinityAvailable(provider, model, affinity, available)
+			s.mu.Lock()
+			selected := s.rememberedAffinityAvailableLocked(affinityProvider, model, affinity, available)
+			s.mu.Unlock()
+			if selected == nil {
+				selected = pickAffinityAvailable(affinityProvider, model, affinity, available)
+			}
 			if selected == nil {
 				return nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 			}

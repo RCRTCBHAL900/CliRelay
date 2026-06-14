@@ -634,6 +634,41 @@ func TestRoundRobinSelectorPick_ClaudeAffinityDistributesAcrossPool(t *testing.T
 	}
 }
 
+func TestRoundRobinSelectorPick_ClaudeAffinityAppliesInMixedScope(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	auths := []*Auth{
+		{ID: "a", Provider: "claude"},
+		{ID: "b", Provider: "claude"},
+		{ID: "c", Provider: "claude"},
+	}
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.AuthAffinityMetadataKey: "tcb:user-mixed:key-1"},
+	}
+
+	first, err := selector.Pick(context.Background(), "mixed", "claude-opus-4-8", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() first error = %v", err)
+	}
+	if first == nil {
+		t.Fatal("Pick() first auth = nil")
+	}
+
+	for i := 0; i < 8; i++ {
+		got, err := selector.Pick(context.Background(), "mixed", "claude-opus-4-8", opts, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() #%d auth = nil", i)
+		}
+		if got.ID != first.ID {
+			t.Fatalf("Pick() #%d auth.ID = %q, want sticky %q", i, got.ID, first.ID)
+		}
+	}
+}
+
 func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 	t.Parallel()
 

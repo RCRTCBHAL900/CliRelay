@@ -130,6 +130,11 @@ type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
 }
 
+type affinitySelectionMemory interface {
+	RememberAffinitySelection(provider, model, affinity, authID string)
+	ForgetAffinitySelection(provider, model, affinity, authID string)
+}
+
 // Hook captures lifecycle callbacks for observing auth changes.
 type Hook interface {
 	// OnAuthRegistered fires when a new auth is registered.
@@ -752,6 +757,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
 		result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
 		if errExec != nil {
+			m.forgetAffinitySelection(opts.Metadata, provider, routeModel, auth.ID)
 			releaseAuth()
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, errCtx
@@ -775,6 +781,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		releaseAuth()
 		m.MarkResult(execCtx, result)
+		m.rememberAffinitySelection(opts.Metadata, provider, routeModel, auth.ID)
 		return resp, nil
 	}
 }
@@ -821,6 +828,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		execReq.Model = m.applyAPIKeyModelAlias(auth, execReq.Model)
 		resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
 		if errExec != nil {
+			m.forgetAffinitySelection(opts.Metadata, provider, routeModel, auth.ID)
 			releaseAuth()
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, errCtx
@@ -835,6 +843,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			continue
 		}
 		releaseAuth()
+		m.rememberAffinitySelection(opts.Metadata, provider, routeModel, auth.ID)
 		return resp, nil
 	}
 }
@@ -881,6 +890,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		execReq.Model = m.applyAPIKeyModelAlias(auth, execReq.Model)
 		streamResult, errStream := executor.ExecuteStream(execCtx, auth, execReq, opts)
 		if errStream != nil {
+			m.forgetAffinitySelection(opts.Metadata, provider, routeModel, auth.ID)
 			releaseAuth()
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -901,6 +911,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			lastErr = errStream
 			continue
 		}
+		m.rememberAffinitySelection(opts.Metadata, provider, routeModel, auth.ID)
 		out := make(chan cliproxyexecutor.StreamChunk)
 		go func(streamCtx context.Context, streamAuth *Auth, streamProvider string, streamChunks <-chan cliproxyexecutor.StreamChunk) {
 			defer releaseAuth()
@@ -910,6 +921,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			for chunk := range streamChunks {
 				if chunk.Err != nil && !failed {
 					failed = true
+					m.forgetAffinitySelection(opts.Metadata, streamProvider, routeModel, streamAuth.ID)
 					rerr := &Error{Message: chunk.Err.Error()}
 					if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 						rerr.HTTPStatus = se.StatusCode()
@@ -1059,6 +1071,49 @@ func publishSelectedAuthMetadata(meta map[string]any, authID string) {
 	meta[cliproxyexecutor.SelectedAuthMetadataKey] = authID
 	if callback, ok := meta[cliproxyexecutor.SelectedAuthCallbackMetadataKey].(func(string)); ok && callback != nil {
 		callback(authID)
+	}
+}
+
+func (m *Manager) affinitySelectionMemoryForMetadata(meta map[string]any) affinitySelectionMemory {
+	if m == nil || len(meta) == 0 {
+		return nil
+	}
+	if authSelectionAffinity(meta) == "" {
+		return nil
+	}
+	allowedGroups := allowedChannelGroupsFromMetadata(meta)
+	routeGroup := routeGroupFromMetadata(meta)
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	m.mu.RLock()
+	selector := m.selectorForRoutingScopeLocked(cfg, routeGroup, allowedGroups)
+	m.mu.RUnlock()
+	recorder, _ := selector.(affinitySelectionMemory)
+	return recorder
+}
+
+func (m *Manager) rememberAffinitySelection(meta map[string]any, provider, model, authID string) {
+	if len(meta) == 0 || !strings.EqualFold(strings.TrimSpace(provider), "claude") {
+		return
+	}
+	affinity := authSelectionAffinity(meta)
+	if affinity == "" {
+		return
+	}
+	if recorder := m.affinitySelectionMemoryForMetadata(meta); recorder != nil {
+		recorder.RememberAffinitySelection(provider, model, affinity, authID)
+	}
+}
+
+func (m *Manager) forgetAffinitySelection(meta map[string]any, provider, model, authID string) {
+	if len(meta) == 0 || !strings.EqualFold(strings.TrimSpace(provider), "claude") {
+		return
+	}
+	affinity := authSelectionAffinity(meta)
+	if affinity == "" {
+		return
+	}
+	if recorder := m.affinitySelectionMemoryForMetadata(meta); recorder != nil {
+		recorder.ForgetAffinitySelection(provider, model, affinity, authID)
 	}
 }
 
