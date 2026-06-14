@@ -10,18 +10,22 @@ func TestNormalizeProxyPoolTrimsDeduplicatesAndValidatesEntries(t *testing.T) {
 		{ID: "hk-1", Name: "duplicate", URL: "http://127.0.0.1:7890", Enabled: true},
 		{ID: "bad", Name: "bad", URL: "ftp://127.0.0.1:21", Enabled: true},
 		{ID: "", Name: "auto id", URL: "https://proxy.example.com:8443", Enabled: true},
+		{ID: "", Name: "direct", SourceIP: " 152.89.86.108 ", Enabled: true},
 	}
 
 	got := NormalizeProxyPool(input)
 
-	if len(got) != 2 {
-		t.Fatalf("NormalizeProxyPool length = %d, want 2: %#v", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("NormalizeProxyPool length = %d, want 3: %#v", len(got), got)
 	}
 	if got[0].ID != "hk-1" || got[0].Name != "HK 1" || got[0].URL != "socks5://user:pass@127.0.0.1:1080" || got[0].Description != "primary" {
 		t.Fatalf("first normalized entry = %#v", got[0])
 	}
 	if got[1].ID == "" || got[1].URL != "https://proxy.example.com:8443" {
 		t.Fatalf("second normalized entry = %#v", got[1])
+	}
+	if got[2].ID != "source-ip-152-89-86-108" || got[2].SourceIP != "152.89.86.108" {
+		t.Fatalf("third normalized entry = %#v", got[2])
 	}
 }
 
@@ -45,6 +49,22 @@ func TestValidateProxyURLAllowsSupportedSchemesOnly(t *testing.T) {
 	}
 }
 
+func TestValidateSourceIPAcceptsIPv4Only(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{"152.89.86.108", "127.0.0.1"} {
+		if err := ValidateSourceIP(raw); err != nil {
+			t.Fatalf("ValidateSourceIP(%q) returned error: %v", raw, err)
+		}
+	}
+
+	for _, raw := range []string{"", "2001:db8::1", "not-an-ip"} {
+		if err := ValidateSourceIP(raw); err == nil {
+			t.Fatalf("ValidateSourceIP(%q) returned nil, want error", raw)
+		}
+	}
+}
+
 func TestResolveProxyURLUsesProxyIDBeforeFallback(t *testing.T) {
 	t.Parallel()
 
@@ -52,6 +72,7 @@ func TestResolveProxyURLUsesProxyIDBeforeFallback(t *testing.T) {
 		SDKConfig: SDKConfig{ProxyURL: "http://global.example:7890"},
 		ProxyPool: []ProxyPoolEntry{
 			{ID: "hk", Name: "HK", URL: "socks5://127.0.0.1:1080", Enabled: true},
+			{ID: "direct", Name: "Direct", SourceIP: "152.89.86.108", Enabled: true},
 			{ID: "disabled", Name: "Disabled", URL: "http://disabled.example:7890", Enabled: false},
 		},
 	}
@@ -63,6 +84,7 @@ func TestResolveProxyURLUsesProxyIDBeforeFallback(t *testing.T) {
 		want        string
 	}{
 		{name: "proxy id wins", proxyID: "hk", fallbackURL: "http://fallback.example:7890", want: "socks5://127.0.0.1:1080"},
+		{name: "source ip route wins", proxyID: "direct", fallbackURL: "http://fallback.example:7890", want: "sourceip://152.89.86.108"},
 		{name: "disabled falls back to entry url", proxyID: "disabled", fallbackURL: "http://fallback.example:7890", want: "http://fallback.example:7890"},
 		{name: "missing falls back to entry url", proxyID: "missing", fallbackURL: "http://fallback.example:7890", want: "http://fallback.example:7890"},
 		{name: "global fallback", proxyID: "", fallbackURL: "", want: "http://global.example:7890"},

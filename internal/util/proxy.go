@@ -5,10 +5,13 @@ package util
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -22,6 +25,7 @@ const (
 	DefaultHTTPTLSHandshakeTimeout  = 10 * time.Second
 	DefaultHTTPResponseHeaderTimout = 30 * time.Second
 	DefaultHTTPIdleConnTimeout      = 90 * time.Second
+	SourceIPProxyScheme             = "sourceip"
 )
 
 func NewHTTPClient(timeout time.Duration) *http.Client {
@@ -89,12 +93,103 @@ func BuildProxyTransport(proxyURL string, preferIPv4 bool) *http.Transport {
 		}
 	case "http", "https":
 		transport.Proxy = http.ProxyURL(parsedURL)
+	case SourceIPProxyScheme:
+		transport = BuildSourceIPTransport(parsedURL.Host, preferIPv4)
 	default:
 		log.Errorf("unsupported proxy scheme: %s", parsedURL.Scheme)
 		return nil
 	}
 
 	return transport
+}
+
+func BuildSourceIPTransport(sourceIP string, preferIPv4 bool) *http.Transport {
+	parsedIP := net.ParseIP(strings.TrimSpace(sourceIP))
+	if parsedIP == nil {
+		log.Errorf("invalid source ip: %s", sourceIP)
+		return nil
+	}
+	if parsedIP = parsedIP.To4(); parsedIP == nil {
+		log.Errorf("source ip must be IPv4: %s", sourceIP)
+		return nil
+	}
+
+	transport := NewDefaultTransport(preferIPv4)
+	primaryDialer := &net.Dialer{
+		Timeout:   DefaultHTTPDialTimeout,
+		KeepAlive: 30 * time.Second,
+		LocalAddr: &net.TCPAddr{IP: parsedIP},
+	}
+	fallbackDialer := &net.Dialer{
+		Timeout:   DefaultHTTPDialTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+	transport.Proxy = nil
+	transport.DialContext = sourceIPDialContext(
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return primaryDialer.DialContext(ctx, network, addr)
+		},
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return fallbackDialer.DialContext(ctx, network, addr)
+		},
+		sourceIP,
+		preferIPv4,
+		sourceIPBindFallbackEnabled(),
+	)
+	return transport
+}
+
+func sourceIPDialContext(
+	primary func(context.Context, string, string) (net.Conn, error),
+	fallback func(context.Context, string, string) (net.Conn, error),
+	sourceIP string,
+	preferIPv4 bool,
+	fallbackEnabled bool,
+) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialNetwork := network
+		if preferIPv4 {
+			dialNetwork = "tcp4"
+		}
+		conn, err := primary(ctx, dialNetwork, addr)
+		if err == nil || !shouldRetrySourceIPDial(err) || !fallbackEnabled {
+			return conn, err
+		}
+		log.Warnf(
+			"source ip dial failed for %s (%v); falling back to default egress",
+			strings.TrimSpace(sourceIP),
+			err,
+		)
+		return fallback(ctx, dialNetwork, addr)
+	}
+}
+
+func sourceIPBindFallbackEnabled() bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("CLIRELAY_SOURCEIP_BIND_FALLBACK")))
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldRetrySourceIPDial(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EADDRNOTAVAIL) {
+		return true
+	}
+	var sysErr *os.SyscallError
+	if errors.As(err, &sysErr) && errors.Is(sysErr.Err, syscall.EADDRNOTAVAIL) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && errors.Is(opErr.Err, syscall.EADDRNOTAVAIL) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "cannot assign requested address")
 }
 
 // SetProxy configures the provided HTTP client with proxy settings from the configuration.

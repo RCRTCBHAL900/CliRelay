@@ -3,6 +3,7 @@ package management
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -149,6 +150,164 @@ func TestRegisterAuthFromFileAppliesRoutingMetadata(t *testing.T) {
 	}
 	if auth.ProxyID != "premium-egress" {
 		t.Fatalf("ProxyID = %q, want premium-egress", auth.ProxyID)
+	}
+}
+
+func TestRegisterAuthFromFileAutoAssignsClaudeSourceIPLane(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := &Handler{
+		cfg: &config.Config{
+			AuthDir: authDir,
+			ProxyPool: []config.ProxyPoolEntry{
+				{ID: "lane-a", Name: "Lane A", SourceIP: "152.89.86.108", Enabled: true},
+				{ID: "lane-b", Name: "Lane B", SourceIP: "152.89.86.109", Enabled: true},
+			},
+		},
+		authManager: manager,
+	}
+
+	existingPath := filepath.Join(authDir, "existing.json")
+	if err := os.WriteFile(existingPath, []byte(`{"type":"claude","email":"existing@example.com","proxy_id":"lane-a"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile existing: %v", err)
+	}
+	if err := h.registerAuthFromFile(context.Background(), existingPath, nil); err != nil {
+		t.Fatalf("register existing auth: %v", err)
+	}
+
+	newPath := filepath.Join(authDir, "new.json")
+	if err := os.WriteFile(newPath, []byte(`{"type":"claude","email":"new@example.com"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile new: %v", err)
+	}
+	if err := h.registerAuthFromFile(context.Background(), newPath, nil); err != nil {
+		t.Fatalf("register new auth: %v", err)
+	}
+
+	auth, ok := manager.GetByID("new.json")
+	if !ok || auth == nil {
+		t.Fatalf("registered auth not found")
+	}
+	if auth.ProxyURL != "sourceip://152.89.86.109" {
+		t.Fatalf("ProxyURL = %q, want sourceip://152.89.86.109", auth.ProxyURL)
+	}
+	if auth.ProxyID != "lane-b" {
+		t.Fatalf("ProxyID = %q, want lane-b", auth.ProxyID)
+	}
+
+	raw, err := os.ReadFile(newPath)
+	if err != nil {
+		t.Fatalf("ReadFile new: %v", err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		t.Fatalf("Unmarshal new auth: %v", err)
+	}
+	if got, _ := metadata["proxy_url"].(string); got != "sourceip://152.89.86.109" {
+		t.Fatalf("persisted proxy_url = %#v, want sourceip://152.89.86.109", metadata["proxy_url"])
+	}
+	if got, _ := metadata["proxy_id"].(string); got != "lane-b" {
+		t.Fatalf("persisted proxy_id = %#v, want lane-b", metadata["proxy_id"])
+	}
+}
+
+func TestRegisterAuthFromFileFallsBackToObservedClaudeLanes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := &Handler{
+		cfg: &config.Config{
+			AuthDir: authDir,
+		},
+		authManager: manager,
+	}
+
+	existingPath := filepath.Join(authDir, "existing.json")
+	if err := os.WriteFile(existingPath, []byte(`{"type":"claude","email":"existing@example.com","proxy_url":"sourceip://152.89.86.108","proxy_id":"lane-a"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile existing: %v", err)
+	}
+	if err := h.registerAuthFromFile(context.Background(), existingPath, nil); err != nil {
+		t.Fatalf("register existing auth: %v", err)
+	}
+
+	newPath := filepath.Join(authDir, "new.json")
+	if err := os.WriteFile(newPath, []byte(`{"type":"claude","email":"new@example.com"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile new: %v", err)
+	}
+	if err := h.registerAuthFromFile(context.Background(), newPath, nil); err != nil {
+		t.Fatalf("register new auth: %v", err)
+	}
+
+	auth, ok := manager.GetByID("new.json")
+	if !ok || auth == nil {
+		t.Fatalf("registered auth not found")
+	}
+	if auth.ProxyURL != "sourceip://152.89.86.108" {
+		t.Fatalf("ProxyURL = %q, want sourceip://152.89.86.108", auth.ProxyURL)
+	}
+	if auth.ProxyID != "lane-a" {
+		t.Fatalf("ProxyID = %q, want lane-a", auth.ProxyID)
+	}
+}
+
+func TestListAuthFilesSupportsProviderSearchAndPagination(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := &Handler{
+		cfg: &config.Config{
+			AuthDir: authDir,
+		},
+		authManager: manager,
+	}
+
+	files := map[string]string{
+		"alpha.json": `{"type":"claude","email":"alpha@example.com"}`,
+		"beta.json":  `{"type":"claude","email":"beta@example.com"}`,
+		"gamma.json": `{"type":"codex","email":"gamma@example.com"}`,
+	}
+	for name, raw := range files {
+		path := filepath.Join(authDir, name)
+		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+			t.Fatalf("WriteFile %s: %v", name, err)
+		}
+		if err := h.registerAuthFromFile(context.Background(), path, nil); err != nil {
+			t.Fatalf("register %s: %v", name, err)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/auth-files?provider=claude&search=beta&limit=1&offset=0", nil)
+
+	h.ListAuthFiles(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var payload struct {
+		Files    []map[string]any `json:"files"`
+		Total    int              `json:"total"`
+		Offset   int              `json:"offset"`
+		Limit    int              `json:"limit"`
+		Returned int              `json:"returned"`
+		HasMore  bool             `json:"has_more"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal response: %v", err)
+	}
+	if payload.Total != 1 || payload.Returned != 1 || payload.Offset != 0 || payload.Limit != 1 || payload.HasMore {
+		t.Fatalf("unexpected pagination payload: %#v", payload)
+	}
+	if len(payload.Files) != 1 || payload.Files[0]["name"] != "beta.json" {
+		t.Fatalf("files = %#v, want beta.json", payload.Files)
 	}
 }
 

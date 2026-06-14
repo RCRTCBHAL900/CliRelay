@@ -4,9 +4,12 @@
 package claude
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -192,6 +195,10 @@ func (o *ClaudeAuth) ExchangeCodeForTokensWithRedirectURI(ctx context.Context, c
 	if err != nil {
 		return nil, fmt.Errorf("failed to read token response: %w", err)
 	}
+	body, err = decodeClaudeOAuthResponseBody(body, resp.Header.Get("Content-Encoding"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode token response: %w", err)
+	}
 	// log.Debugf("Token response: %s", string(body))
 
 	if resp.StatusCode != http.StatusOK {
@@ -276,6 +283,10 @@ func (o *ClaudeAuth) RefreshTokens(ctx context.Context, refreshToken string) (*C
 	body, err := util.ReadHTTPResponseBody("claude-oauth", resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read refresh response: %w", err)
+	}
+	body, err = decodeClaudeOAuthResponseBody(body, resp.Header.Get("Content-Encoding"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode refresh response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -371,4 +382,36 @@ func (o *ClaudeAuth) UpdateTokenStorage(storage *ClaudeTokenStorage, tokenData *
 	storage.LastRefresh = time.Now().Format(time.RFC3339)
 	storage.Email = tokenData.Email
 	storage.Expire = tokenData.Expire
+}
+
+func decodeClaudeOAuthResponseBody(body []byte, contentEncoding string) ([]byte, error) {
+	if len(body) == 0 {
+		return body, nil
+	}
+	encoding := strings.ToLower(strings.TrimSpace(contentEncoding))
+	if encoding != "" && encoding != "gzip" {
+		return body, nil
+	}
+	if encoding != "gzip" && !looksLikeGzip(body) {
+		return body, nil
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		if encoding == "gzip" {
+			return nil, fmt.Errorf("create gzip reader: %w", err)
+		}
+		return body, nil
+	}
+	defer func() {
+		_ = reader.Close()
+	}()
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("read gzip body: %w", err)
+	}
+	return decoded, nil
+}
+
+func looksLikeGzip(body []byte) bool {
+	return len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b
 }

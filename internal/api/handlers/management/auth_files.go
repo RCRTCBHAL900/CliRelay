@@ -19,6 +19,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/bodyutil"
@@ -33,6 +34,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -543,15 +545,22 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
+	offset, limit, providerFilter, searchFilter, err := parseAuthFileListFilters(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if h.authManager == nil {
-		h.listAuthFilesFromDisk(c)
+		h.listAuthFilesFromDisk(c, offset, limit, providerFilter, searchFilter)
 		return
 	}
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
-			files = append(files, entry)
+			if authFileEntryMatches(entry, providerFilter, searchFilter) {
+				files = append(files, entry)
+			}
 		}
 	}
 	sort.Slice(files, func(i, j int) bool {
@@ -559,7 +568,15 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
-	c.JSON(200, gin.H{"files": files})
+	pageFiles, total, returned, hasMore := paginateAuthFileEntries(files, offset, limit)
+	c.JSON(200, gin.H{
+		"files":    pageFiles,
+		"total":    total,
+		"offset":   offset,
+		"limit":    limit,
+		"returned": returned,
+		"has_more": hasMore,
+	})
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -611,7 +628,7 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 }
 
 // List auth files from disk when the auth manager is unavailable.
-func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
+func (h *Handler) listAuthFilesFromDisk(c *gin.Context, offset int, limit int, providerFilter string, searchFilter string) {
 	entries, err := os.ReadDir(h.cfg.AuthDir)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
@@ -642,10 +659,98 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				}
 			}
 
-			files = append(files, fileData)
+			if authFileEntryMatches(fileData, providerFilter, searchFilter) {
+				files = append(files, fileData)
+			}
 		}
 	}
-	c.JSON(200, gin.H{"files": files})
+	sort.Slice(files, func(i, j int) bool {
+		nameI, _ := files[i]["name"].(string)
+		nameJ, _ := files[j]["name"].(string)
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
+	pageFiles, total, returned, hasMore := paginateAuthFileEntries(files, offset, limit)
+	c.JSON(200, gin.H{
+		"files":    pageFiles,
+		"total":    total,
+		"offset":   offset,
+		"limit":    limit,
+		"returned": returned,
+		"has_more": hasMore,
+	})
+}
+
+func parseAuthFileListFilters(c *gin.Context) (offset int, limit int, providerFilter string, searchFilter string, err error) {
+	if c == nil {
+		return 0, 0, "", "", nil
+	}
+	if raw := strings.TrimSpace(c.Query("offset")); raw != "" {
+		offset, err = strconv.Atoi(raw)
+		if err != nil || offset < 0 {
+			return 0, 0, "", "", fmt.Errorf("offset must be a non-negative integer")
+		}
+	}
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		limit, err = strconv.Atoi(raw)
+		if err != nil || limit < 0 {
+			return 0, 0, "", "", fmt.Errorf("limit must be a non-negative integer")
+		}
+		if limit > 500 {
+			limit = 500
+		}
+	}
+	providerFilter = strings.ToLower(strings.TrimSpace(c.Query("provider")))
+	searchFilter = strings.ToLower(strings.TrimSpace(c.Query("search")))
+	return offset, limit, providerFilter, searchFilter, nil
+}
+
+func paginateAuthFileEntries(files []gin.H, offset int, limit int) ([]gin.H, int, int, bool) {
+	total := len(files)
+	if offset >= total {
+		return []gin.H{}, total, 0, false
+	}
+	end := total
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	pageFiles := files[offset:end]
+	return pageFiles, total, len(pageFiles), end < total
+}
+
+func authFileEntryMatches(entry gin.H, providerFilter string, searchFilter string) bool {
+	if len(entry) == 0 {
+		return false
+	}
+	if providerFilter != "" {
+		provider := strings.ToLower(strings.TrimSpace(stringFromAny(entry["provider"])))
+		authType := strings.ToLower(strings.TrimSpace(stringFromAny(entry["type"])))
+		if provider != providerFilter && authType != providerFilter {
+			return false
+		}
+	}
+	if searchFilter == "" {
+		return true
+	}
+	for _, key := range []string{"name", "email", "label", "provider", "type", "status", "status_message"} {
+		if value := strings.ToLower(strings.TrimSpace(stringFromAny(entry[key]))); value != "" && strings.Contains(value, searchFilter) {
+			return true
+		}
+	}
+	return false
+}
+
+func stringFromAny(value any) string {
+	if value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case fmt.Stringer:
+		return typed.String()
+	default:
+		return fmt.Sprintf("%v", typed)
+	}
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
@@ -679,6 +784,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"runtime_only":   runtimeOnly,
 		"source":         "memory",
 		"size":           int64(0),
+	}
+	if proxyID := strings.TrimSpace(auth.ProxyID); proxyID != "" {
+		entry["proxy_id"] = proxyID
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
@@ -1263,9 +1371,23 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 			return fmt.Errorf("failed to read auth file: %w", err)
 		}
 	}
-	metadata := make(map[string]any)
-	if err := json.Unmarshal(data, &metadata); err != nil {
-		return fmt.Errorf("invalid auth file: %w", err)
+	normalizedData, metadata, changed, err := h.prepareManagedAuthFile(path, data)
+	if err != nil {
+		return err
+	}
+	if changed && path != "" {
+		if errWrite := os.WriteFile(path, normalizedData, 0o600); errWrite != nil {
+			return fmt.Errorf("failed to write normalized auth file: %w", errWrite)
+		}
+		data = normalizedData
+	}
+	if metadata == nil {
+		metadata = make(map[string]any)
+	}
+	if len(metadata) == 0 {
+		if err := json.Unmarshal(data, &metadata); err != nil {
+			return fmt.Errorf("invalid auth file: %w", err)
+		}
 	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
@@ -1309,8 +1431,237 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 		_, err := h.authManager.Update(ctx, auth)
 		return err
 	}
-	_, err := h.authManager.Register(ctx, auth)
+	_, err = h.authManager.Register(ctx, auth)
 	return err
+}
+
+func (h *Handler) prepareManagedAuthFile(path string, data []byte) ([]byte, map[string]any, bool, error) {
+	metadata := make(map[string]any)
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil, nil, false, fmt.Errorf("invalid auth file: %w", err)
+	}
+	changed := false
+	provider := strings.ToLower(strings.TrimSpace(metadataString(metadata, "type", "provider")))
+	if provider == "claude" {
+		authID := h.authIDForPath(path)
+		if authID == "" {
+			authID = filepath.Base(path)
+		}
+		proxyURL := strings.TrimSpace(routingMetadataString(metadata, "proxy_url", "proxy-url", "proxyUrl"))
+		proxyID := strings.TrimSpace(routingMetadataString(metadata, "proxy_id", "proxy-id", "proxyId"))
+		if proxyURL == "" {
+			if assigned := h.selectAutomaticProxyEntry(provider, authID); assigned != nil {
+				if resolvedURL := resolveAutomaticProxyURL(*assigned); resolvedURL != "" {
+					metadata["proxy_url"] = resolvedURL
+					changed = true
+				}
+				if assignedID := strings.TrimSpace(assigned.ID); proxyID == "" && assignedID != "" {
+					metadata["proxy_id"] = assignedID
+					changed = true
+				}
+			}
+		}
+	}
+	if !changed {
+		return data, metadata, false, nil
+	}
+	normalizedData, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("failed to marshal auth file metadata: %w", err)
+	}
+	return normalizedData, metadata, true, nil
+}
+
+func (h *Handler) selectAutomaticProxyEntry(provider string, authID string) *config.ProxyPoolEntry {
+	entries := h.listEnabledProxyPoolEntries()
+	if len(entries) == 0 {
+		entries = h.listObservedProxyEntries(provider, authID)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	assignments := make(map[string]int, len(entries))
+	for _, entry := range entries {
+		if key := proxyPoolAssignmentKey(entry); key != "" {
+			assignments[key] = 0
+		}
+	}
+	if h != nil && h.authManager != nil {
+		for _, auth := range h.authManager.List() {
+			if auth == nil || auth.ID == authID {
+				continue
+			}
+			if provider != "" && !strings.EqualFold(strings.TrimSpace(auth.Provider), provider) {
+				continue
+			}
+			assignmentKey := assignedAuthProxyKey(auth)
+			if assignmentKey == "" {
+				continue
+			}
+			if _, ok := assignments[assignmentKey]; ok {
+				assignments[assignmentKey]++
+			}
+		}
+	}
+
+	bestIndex := -1
+	bestCount := int(^uint(0) >> 1)
+	for idx, entry := range entries {
+		count := assignments[proxyPoolAssignmentKey(entry)]
+		if bestIndex == -1 || count < bestCount {
+			bestIndex = idx
+			bestCount = count
+		}
+	}
+	if bestIndex < 0 {
+		return nil
+	}
+	entry := entries[bestIndex]
+	return &entry
+}
+
+func (h *Handler) listEnabledProxyPoolEntries() []config.ProxyPoolEntry {
+	var entries []config.ProxyPoolEntry
+	if usage.ProxyPoolStoreAvailable() {
+		entries = usage.ListProxyPool()
+	} else if h != nil && h.cfg != nil {
+		entries = append(entries, h.cfg.ProxyPool...)
+	}
+	out := make([]config.ProxyPoolEntry, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.Enabled {
+			continue
+		}
+		if strings.TrimSpace(entry.URL) == "" && strings.TrimSpace(entry.SourceIP) == "" {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func (h *Handler) listObservedProxyEntries(provider string, authID string) []config.ProxyPoolEntry {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	out := make([]config.ProxyPoolEntry, 0)
+	for _, auth := range h.authManager.List() {
+		if auth == nil || auth.ID == authID {
+			continue
+		}
+		if provider != "" && !strings.EqualFold(strings.TrimSpace(auth.Provider), provider) {
+			continue
+		}
+		entry, ok := observedProxyEntryFromAuth(auth)
+		if !ok {
+			continue
+		}
+		key := proxyPoolAssignmentKey(entry)
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func normalizeProxyPoolSelectionID(raw string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	if trimmed == "" {
+		return ""
+	}
+	var b strings.Builder
+	lastDash := false
+	for _, r := range trimmed {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func proxyPoolAssignmentKey(entry config.ProxyPoolEntry) string {
+	if sourceIP := strings.TrimSpace(entry.SourceIP); sourceIP != "" {
+		return normalizeProxyPoolSelectionID(config.SourceIPTransportURL(sourceIP))
+	}
+	if proxyURL := strings.TrimSpace(entry.URL); proxyURL != "" {
+		return normalizeProxyPoolSelectionID(proxyURL)
+	}
+	return normalizeProxyPoolSelectionID(entry.ID)
+}
+
+func assignedAuthProxyKey(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+		return normalizeProxyPoolSelectionID(proxyURL)
+	}
+	if proxyID := strings.TrimSpace(auth.ProxyID); proxyID != "" {
+		return normalizeProxyPoolSelectionID(proxyID)
+	}
+	return ""
+}
+
+func resolveAutomaticProxyURL(entry config.ProxyPoolEntry) string {
+	if sourceIP := strings.TrimSpace(entry.SourceIP); sourceIP != "" {
+		return config.SourceIPTransportURL(sourceIP)
+	}
+	return strings.TrimSpace(entry.URL)
+}
+
+func observedProxyEntryFromAuth(auth *coreauth.Auth) (config.ProxyPoolEntry, bool) {
+	if auth == nil {
+		return config.ProxyPoolEntry{}, false
+	}
+	if sourceIP, ok := sourceIPFromProxyURL(auth.ProxyURL); ok {
+		id := strings.TrimSpace(auth.ProxyID)
+		if id == "" {
+			id = "source-ip-" + normalizeProxyPoolSelectionID(sourceIP)
+		}
+		return config.ProxyPoolEntry{
+			ID:       id,
+			Name:     id,
+			SourceIP: sourceIP,
+			Enabled:  true,
+		}, true
+	}
+	if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+		id := strings.TrimSpace(auth.ProxyID)
+		if id == "" {
+			id = "proxy-" + normalizeProxyPoolSelectionID(proxyURL)
+		}
+		return config.ProxyPoolEntry{
+			ID:      id,
+			Name:    id,
+			URL:     proxyURL,
+			Enabled: true,
+		}, true
+	}
+	return config.ProxyPoolEntry{}, false
+}
+
+func sourceIPFromProxyURL(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if !strings.HasPrefix(trimmed, "sourceip://") {
+		return "", false
+	}
+	sourceIP := strings.TrimSpace(strings.TrimPrefix(trimmed, "sourceip://"))
+	if config.ValidateSourceIP(sourceIP) != nil {
+		return "", false
+	}
+	return sourceIP, true
 }
 
 // PatchAuthFileStatus toggles the disabled state of an auth file
