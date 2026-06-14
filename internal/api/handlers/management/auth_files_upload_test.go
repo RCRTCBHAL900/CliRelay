@@ -211,6 +211,12 @@ func TestRegisterAuthFromFileAutoAssignsClaudeSourceIPLane(t *testing.T) {
 	if got, _ := metadata["proxy_id"].(string); got != "lane-b" {
 		t.Fatalf("persisted proxy_id = %#v, want lane-b", metadata["proxy_id"])
 	}
+	if got, _ := metadata["load_aware_scheduler"].(bool); !got {
+		t.Fatalf("persisted load_aware_scheduler = %#v, want true", metadata["load_aware_scheduler"])
+	}
+	if got, ok := metadata["concurrency_limit"].(float64); !ok || int(got) != 1 {
+		t.Fatalf("persisted concurrency_limit = %#v, want 1", metadata["concurrency_limit"])
+	}
 }
 
 func TestRegisterAuthFromFileFallsBackToObservedClaudeLanes(t *testing.T) {
@@ -254,6 +260,121 @@ func TestRegisterAuthFromFileFallsBackToObservedClaudeLanes(t *testing.T) {
 	}
 }
 
+func TestSaveTokenRecordAutoAssignsClaudeSourceIPLane(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := &Handler{
+		cfg: &config.Config{
+			ProxyPool: []config.ProxyPoolEntry{
+				{ID: "lane-a", Name: "Lane A", SourceIP: "152.89.86.108", Enabled: true},
+				{ID: "lane-b", Name: "Lane B", SourceIP: "152.89.86.109", Enabled: true},
+			},
+		},
+		authManager: manager,
+		tokenStore:  store,
+	}
+
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "existing.json",
+		FileName: "existing.json",
+		Provider: "claude",
+		ProxyID:  "lane-a",
+		ProxyURL: "sourceip://152.89.86.108",
+		Metadata: map[string]any{
+			"type":      "claude",
+			"proxy_id":  "lane-a",
+			"proxy_url": "sourceip://152.89.86.108",
+		},
+		}); err != nil {
+		t.Fatalf("register existing auth: %v", err)
+	}
+
+	record := &coreauth.Auth{
+		ID:       "new.json",
+		FileName: "new.json",
+		Provider: "claude",
+		Metadata: map[string]any{
+			"type":          "claude",
+			"email":         "new@example.com",
+			"access_token":  "at-test",
+			"refresh_token": "rt-test",
+		},
+	}
+
+	if _, err := h.saveTokenRecord(context.Background(), record); err != nil {
+		t.Fatalf("saveTokenRecord: %v", err)
+	}
+
+	store.mu.Lock()
+	saved := store.items["new.json"]
+	store.mu.Unlock()
+	if saved == nil {
+		t.Fatalf("saved auth not found")
+	}
+	if saved.ProxyID != "lane-b" {
+		t.Fatalf("ProxyID = %q, want lane-b", saved.ProxyID)
+	}
+	if saved.ProxyURL != "sourceip://152.89.86.109" {
+		t.Fatalf("ProxyURL = %q, want sourceip://152.89.86.109", saved.ProxyURL)
+	}
+	if got, _ := saved.Metadata["proxy_id"].(string); got != "lane-b" {
+		t.Fatalf("metadata proxy_id = %#v, want lane-b", saved.Metadata["proxy_id"])
+	}
+	if got, _ := saved.Metadata["proxy_url"].(string); got != "sourceip://152.89.86.109" {
+		t.Fatalf("metadata proxy_url = %#v, want sourceip://152.89.86.109", saved.Metadata["proxy_url"])
+	}
+	if got, _ := saved.Metadata["load_aware_scheduler"].(bool); !got {
+		t.Fatalf("metadata load_aware_scheduler = %#v, want true", saved.Metadata["load_aware_scheduler"])
+	}
+	if got, ok := saved.Metadata["concurrency_limit"].(int); !ok || got != 2 {
+		t.Fatalf("metadata concurrency_limit = %#v, want 2", saved.Metadata["concurrency_limit"])
+	}
+}
+
+func TestRegisterAuthFromFilePreservesExplicitClaudeSafetyOverrides(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	h := &Handler{
+		cfg: &config.Config{
+			AuthDir: authDir,
+		},
+		authManager: manager,
+	}
+
+	authPath := filepath.Join(authDir, "custom.json")
+	if err := os.WriteFile(authPath, []byte(`{
+		"type":"claude",
+		"email":"custom@example.com",
+		"cookies":[{"name":"sessionKey","value":"x"}],
+		"load_aware_scheduler":false,
+		"concurrency_limit":4
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile custom: %v", err)
+	}
+	if err := h.registerAuthFromFile(context.Background(), authPath, nil); err != nil {
+		t.Fatalf("register custom auth: %v", err)
+	}
+
+	raw, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatalf("ReadFile custom: %v", err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		t.Fatalf("Unmarshal custom auth: %v", err)
+	}
+	if got, _ := metadata["load_aware_scheduler"].(bool); got {
+		t.Fatalf("persisted load_aware_scheduler = %#v, want false override preserved", metadata["load_aware_scheduler"])
+	}
+	if got, ok := metadata["concurrency_limit"].(float64); !ok || int(got) != 4 {
+		t.Fatalf("persisted concurrency_limit = %#v, want 4 override preserved", metadata["concurrency_limit"])
+	}
+}
 func TestListAuthFilesSupportsProviderSearchAndPagination(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
