@@ -88,6 +88,40 @@ func TestEnsureClaudeThinkingDisplay(t *testing.T) {
 	}
 }
 
+func TestNormalizeClaudeAssistantThinkingOrder(t *testing.T) {
+	t.Parallel()
+
+	input := []byte(`{
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"hello"}]},
+			{"role":"assistant","content":[
+				{"type":"text","text":"before"},
+				{"type":"thinking","thinking":"step 1","signature":"sig-1"},
+				{"type":"redacted_thinking","data":"abc"},
+				{"type":"tool_use","name":"Read","id":"tool_1","input":{}}
+			]}
+		]
+	}`)
+
+	out := normalizeClaudeAssistantThinkingOrder(input)
+	content := gjson.GetBytes(out, "messages.1.content").Array()
+	if len(content) != 4 {
+		t.Fatalf("messages.1.content length = %d, want 4", len(content))
+	}
+	gotTypes := []string{
+		content[0].Get("type").String(),
+		content[1].Get("type").String(),
+		content[2].Get("type").String(),
+		content[3].Get("type").String(),
+	}
+	wantTypes := []string{"thinking", "redacted_thinking", "text", "tool_use"}
+	for i := range wantTypes {
+		if gotTypes[i] != wantTypes[i] {
+			t.Fatalf("content[%d].type = %q, want %q; payload=%s", i, gotTypes[i], wantTypes[i], string(out))
+		}
+	}
+}
+
 func TestClaudeExecutor_AddsMissingIndependentCacheBreakpoints(t *testing.T) {
 	var upstreamBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

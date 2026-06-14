@@ -141,6 +141,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		// display mode. Defaulting to summarized avoids downstream clients rendering
 		// signature-only thinking blocks as junk while preserving caller overrides.
 		body = ensureClaudeThinkingDisplay(body)
+		body = normalizeClaudeAssistantThinkingOrder(body)
 
 		// Fill in any missing independent cache breakpoints for tools/system/messages.
 		body = ensureCacheControl(body)
@@ -300,6 +301,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		// display mode. Defaulting to summarized avoids downstream clients rendering
 		// signature-only thinking blocks as junk while preserving caller overrides.
 		body = ensureClaudeThinkingDisplay(body)
+		body = normalizeClaudeAssistantThinkingOrder(body)
 
 		// Fill in any missing independent cache breakpoints for tools/system/messages.
 		body = ensureCacheControl(body)
@@ -1312,6 +1314,63 @@ func ensureClaudeThinkingDisplay(payload []byte) []byte {
 		payload, _ = sjson.DeleteBytes(payload, "thinking.display")
 	}
 	return payload
+}
+
+func normalizeClaudeAssistantThinkingOrder(payload []byte) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return payload
+	}
+
+	for idx, message := range messages.Array() {
+		if strings.TrimSpace(message.Get("role").String()) != "assistant" {
+			continue
+		}
+		content := message.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+
+		parts := content.Array()
+		if len(parts) < 2 {
+			continue
+		}
+
+		thinking := make([]string, 0, len(parts))
+		other := make([]string, 0, len(parts))
+		hasThinking := false
+		needsReorder := false
+		encounteredNonThinking := false
+		for _, part := range parts {
+			partType := strings.ToLower(strings.TrimSpace(part.Get("type").String()))
+			if isClaudeAssistantThinkingPart(partType) {
+				hasThinking = true
+				if encounteredNonThinking {
+					needsReorder = true
+				}
+				thinking = append(thinking, part.Raw)
+				continue
+			}
+			encounteredNonThinking = true
+			other = append(other, part.Raw)
+		}
+		if !hasThinking || !needsReorder {
+			continue
+		}
+
+		reordered := append(thinking, other...)
+		payload, _ = sjson.SetRawBytes(payload, fmt.Sprintf("messages.%d.content", idx), []byte("["+strings.Join(reordered, ",")+"]"))
+	}
+	return payload
+}
+
+func isClaudeAssistantThinkingPart(partType string) bool {
+	switch partType {
+	case "thinking", "redacted_thinking", "reasoning":
+		return true
+	default:
+		return false
+	}
 }
 
 func countCacheControls(payload []byte) int {
