@@ -137,10 +137,8 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 		body = disableThinkingIfToolChoiceForced(body)
 
-		// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-		if countCacheControls(body) == 0 {
-			body = ensureCacheControl(body)
-		}
+		// Fill in any missing independent cache breakpoints for tools/system/messages.
+		body = ensureCacheControl(body)
 	}
 
 	// Extract betas from body and convert to header
@@ -293,10 +291,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 		body = disableThinkingIfToolChoiceForced(body)
 
-		// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-		if countCacheControls(body) == 0 {
-			body = ensureCacheControl(body)
-		}
+		// Fill in any missing independent cache breakpoints for tools/system/messages.
+		body = ensureCacheControl(body)
 	}
 
 	// Extract betas from body and convert to header

@@ -37,6 +37,58 @@ func TestApplyClaudeToolPrefix(t *testing.T) {
 	}
 }
 
+func TestClaudeExecutor_AddsMissingIndependentCacheBreakpoints(t *testing.T) {
+	var upstreamBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		upstreamBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-opus-4-8","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{
+		"model":"claude-opus-4-8",
+		"tools":[
+			{"name":"tool1","description":"First tool","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}
+		],
+		"system":"System prompt that should still get cache_control",
+		"messages":[
+			{"role":"user","content":"First user"},
+			{"role":"assistant","content":"Assistant reply"},
+			{"role":"user","content":"Second user"}
+		]
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if got := gjson.GetBytes(upstreamBody, "tools.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("tool cache_control = %q, want ephemeral", got)
+	}
+	if got := gjson.GetBytes(upstreamBody, "system.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("system cache_control = %q, want ephemeral", got)
+	}
+	if got := gjson.GetBytes(upstreamBody, "messages.0.content.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("message cache_control = %q, want ephemeral", got)
+	}
+}
+
 func TestDecodeResponseBody_DecodesGzipWithoutHeader(t *testing.T) {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
