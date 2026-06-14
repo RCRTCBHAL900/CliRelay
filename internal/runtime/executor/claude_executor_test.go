@@ -172,8 +172,11 @@ func TestClaudeExecutor_AddsMissingIndependentCacheBreakpoints(t *testing.T) {
 	if got := gjson.GetBytes(upstreamBody, "system.0.cache_control.type").String(); got != "ephemeral" {
 		t.Fatalf("system cache_control = %q, want ephemeral", got)
 	}
-	if got := gjson.GetBytes(upstreamBody, "messages.0.content.0.cache_control.type").String(); got != "ephemeral" {
-		t.Fatalf("message cache_control = %q, want ephemeral", got)
+	if got := gjson.GetBytes(upstreamBody, "cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("top-level cache_control = %q, want ephemeral", got)
+	}
+	if got := gjson.GetBytes(upstreamBody, "messages.0.content.0.cache_control").Exists(); got {
+		t.Fatalf("message cache_control should not be injected when using automatic caching; body=%s", string(upstreamBody))
 	}
 }
 

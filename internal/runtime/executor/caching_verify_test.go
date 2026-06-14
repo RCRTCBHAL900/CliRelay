@@ -166,8 +166,8 @@ func TestEnsureCacheControl(t *testing.T) {
 		}
 	})
 
-	// Test case 8: Messages caching for multi-turn (second-to-last user)
-	t.Run("Messages Caching Second-To-Last User", func(t *testing.T) {
+	// Test case 8: Conversation caching uses Anthropic's automatic top-level control
+	t.Run("Conversation Caching Uses Top Level Automatic Control", func(t *testing.T) {
 		input := []byte(`{
 			"model": "claude-3-5-sonnet",
 			"messages": [
@@ -180,19 +180,19 @@ func TestEnsureCacheControl(t *testing.T) {
 		}`)
 		output := ensureCacheControl(input)
 
-		cacheType := gjson.GetBytes(output, "messages.2.content.0.cache_control.type")
+		cacheType := gjson.GetBytes(output, "cache_control.type")
 		if cacheType.String() != "ephemeral" {
-			t.Errorf("cache_control not found on second-to-last user turn. Output: %s", string(output))
+			t.Errorf("top-level automatic cache_control not found. Output: %s", string(output))
 		}
 
-		lastUserCache := gjson.GetBytes(output, "messages.4.content.0.cache_control")
-		if lastUserCache.Exists() {
-			t.Errorf("last user turn should NOT have cache_control")
+		secondToLastUserCache := gjson.GetBytes(output, "messages.2.content.0.cache_control")
+		if secondToLastUserCache.Exists() {
+			t.Errorf("message-level cache_control should not be injected when using automatic caching")
 		}
 	})
 
-	// Test case 9: Existing message cache_control should skip injection
-	t.Run("Messages Skip When Cache Control Exists", func(t *testing.T) {
+	// Test case 9: Existing message cache_control should skip automatic injection
+	t.Run("Messages Skip Automatic Caching When Explicit Breakpoint Exists", func(t *testing.T) {
 		input := []byte(`{
 			"model": "claude-3-5-sonnet",
 			"messages": [
@@ -203,14 +203,30 @@ func TestEnsureCacheControl(t *testing.T) {
 		}`)
 		output := ensureCacheControl(input)
 
-		userCache := gjson.GetBytes(output, "messages.0.content.0.cache_control")
-		if userCache.Exists() {
-			t.Errorf("cache_control should NOT be injected when a message already has cache_control")
+		topLevelCache := gjson.GetBytes(output, "cache_control")
+		if topLevelCache.Exists() {
+			t.Errorf("top-level automatic cache_control should not be injected when a message already has cache_control")
 		}
 
 		existingCache := gjson.GetBytes(output, "messages.1.content.0.cache_control.type")
 		if existingCache.String() != "ephemeral" {
 			t.Errorf("existing cache_control should be preserved. Output: %s", string(output))
+		}
+	})
+
+	// Test case 10: Existing top-level automatic caching should be preserved
+	t.Run("Existing Top Level Automatic Caching Preserved", func(t *testing.T) {
+		input := []byte(`{
+			"model": "claude-3-5-sonnet",
+			"cache_control": {"type": "ephemeral"},
+			"messages": [
+				{"role": "user", "content": "Hello"}
+			]
+		}`)
+		output := ensureCacheControl(input)
+
+		if got := gjson.GetBytes(output, "cache_control.type").String(); got != "ephemeral" {
+			t.Errorf("existing top-level cache_control should be preserved, got %q", got)
 		}
 	})
 }

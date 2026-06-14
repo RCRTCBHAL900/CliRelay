@@ -1489,16 +1489,12 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	return payload
 }
 
-// ensureCacheControl injects cache_control breakpoints into the payload for optimal prompt caching.
-// According to Anthropic's documentation, cache prefixes are created in order: tools -> system -> messages.
-// This function adds cache_control to:
-// 1. The LAST tool in the tools array (caches all tool definitions)
-// 2. The LAST element in the system array (caches system prompt)
-// 3. The SECOND-TO-LAST user turn (caches conversation history for multi-turn)
-//
-// Up to 4 cache breakpoints are allowed per request. Tools, System, and Messages are INDEPENDENT breakpoints.
-// This enables up to 90% cost reduction on cached tokens (cache read = 0.1x base price).
-// See: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+// ensureCacheControl injects prompt-caching controls into the payload.
+// We keep explicit breakpoints on the static layers (tools and system) and use
+// Anthropic's top-level automatic caching for the conversation tail. That
+// avoids a brittle fixed "second-to-last user turn" breakpoint during long
+// agent tool loops, where more than 20 blocks can be appended between user
+// turns and prompt-cache reuse becomes intermittent.
 func ensureCacheControl(payload []byte) []byte {
 	// 1. Inject cache_control into the LAST tool (caches all tool definitions)
 	// Tools are cached first in the hierarchy, so this is the most important breakpoint.
@@ -1508,9 +1504,9 @@ func ensureCacheControl(payload []byte) []byte {
 	// System is the second level in the cache hierarchy.
 	payload = injectSystemCacheControl(payload)
 
-	// 3. Inject cache_control into messages for multi-turn conversation caching
-	// This caches the conversation history up to the second-to-last user turn.
-	payload = injectMessagesCacheControl(payload)
+	// 3. Enable automatic conversation caching for multi-turn prompt reuse.
+	// Anthropic advances this breakpoint automatically as the conversation grows.
+	payload = injectAutomaticConversationCacheControl(payload)
 
 	return payload
 }
@@ -1591,6 +1587,11 @@ func isClaudeAssistantThinkingPart(partType string) bool {
 func countCacheControls(payload []byte) int {
 	count := 0
 
+	// Check top-level automatic cache control
+	if gjson.GetBytes(payload, "cache_control").Exists() {
+		count++
+	}
+
 	// Check system
 	system := gjson.GetBytes(payload, "system")
 	if system.IsArray() {
@@ -1633,19 +1634,24 @@ func countCacheControls(payload []byte) int {
 	return count
 }
 
-// injectMessagesCacheControl adds cache_control to the second-to-last user turn for multi-turn caching.
-// Per Anthropic docs: "Place cache_control on the second-to-last User message to let the model reuse the earlier cache."
-// This enables caching of conversation history, which is especially beneficial for long multi-turn conversations.
-// Only adds cache_control if:
-// - There are at least 2 user turns in the conversation
-// - No message content already has cache_control
-func injectMessagesCacheControl(payload []byte) []byte {
+// injectAutomaticConversationCacheControl enables Anthropic's automatic prompt
+// caching for the conversation tail. We only add it when the client is not
+// already managing conversation breakpoints itself.
+func injectAutomaticConversationCacheControl(payload []byte) []byte {
+	if gjson.GetBytes(payload, "cache_control").Exists() {
+		return payload
+	}
+
 	messages := gjson.GetBytes(payload, "messages")
 	if !messages.Exists() || !messages.IsArray() {
 		return payload
 	}
 
-	// Check if ANY message content already has cache_control
+	if int(messages.Get("#").Int()) == 0 {
+		return payload
+	}
+
+	// Preserve caller-managed conversation breakpoints.
 	hasCacheControlInMessages := false
 	messages.ForEach(func(_, msg gjson.Result) bool {
 		content := msg.Get("content")
@@ -1664,60 +1670,19 @@ func injectMessagesCacheControl(payload []byte) []byte {
 		return payload
 	}
 
-	// Find all user message indices
-	var userMsgIndices []int
-	messages.ForEach(func(index gjson.Result, msg gjson.Result) bool {
-		if msg.Get("role").String() == "user" {
-			userMsgIndices = append(userMsgIndices, int(index.Int()))
-		}
-		return true
-	})
-
-	// Need at least 2 user turns to cache the second-to-last
-	if len(userMsgIndices) < 2 {
+	// Anthropic allows up to four breakpoints per request; leave room if the
+	// caller already supplied multiple explicit breakpoints elsewhere.
+	if countCacheControls(payload) >= 4 {
 		return payload
 	}
 
-	// Get the second-to-last user message index
-	secondToLastUserIdx := userMsgIndices[len(userMsgIndices)-2]
-
-	// Get the content of this message
-	contentPath := fmt.Sprintf("messages.%d.content", secondToLastUserIdx)
-	content := gjson.GetBytes(payload, contentPath)
-
-	if content.IsArray() {
-		// Add cache_control to the last content block of this message
-		contentCount := int(content.Get("#").Int())
-		if contentCount > 0 {
-			cacheControlPath := fmt.Sprintf("messages.%d.content.%d.cache_control", secondToLastUserIdx, contentCount-1)
-			result, err := sjson.SetBytes(payload, cacheControlPath, map[string]string{"type": "ephemeral"})
-			if err != nil {
-				log.Warnf("failed to inject cache_control into messages: %v", err)
-				return payload
-			}
-			payload = result
-		}
-	} else if content.Type == gjson.String {
-		// Convert string content to array with cache_control
-		text := content.String()
-		newContent := []map[string]interface{}{
-			{
-				"type": "text",
-				"text": text,
-				"cache_control": map[string]string{
-					"type": "ephemeral",
-				},
-			},
-		}
-		result, err := sjson.SetBytes(payload, contentPath, newContent)
-		if err != nil {
-			log.Warnf("failed to inject cache_control into message string content: %v", err)
-			return payload
-		}
-		payload = result
+	result, err := sjson.SetBytes(payload, "cache_control", map[string]string{"type": "ephemeral"})
+	if err != nil {
+		log.Warnf("failed to inject top-level cache_control: %v", err)
+		return payload
 	}
 
-	return payload
+	return result
 }
 
 // injectToolsCacheControl adds cache_control to the last tool in the tools array.
