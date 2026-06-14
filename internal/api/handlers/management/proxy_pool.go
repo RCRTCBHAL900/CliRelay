@@ -38,6 +38,7 @@ func (h *Handler) GetProxyPool(c *gin.Context) {
 		}
 		h.mu.Unlock()
 	}
+	entries = config.RealizeProxyPoolEntries(entries)
 
 	items := make([]proxyPoolAPIEntry, 0, len(entries))
 	for _, entry := range entries {
@@ -107,12 +108,7 @@ func (h *Handler) PostProxyPoolCheck(c *gin.Context) {
 
 	proxyURL := strings.TrimSpace(body.URL)
 	if proxyURL == "" && usage.ProxyPoolStoreAvailable() {
-		if entry := usage.GetProxyPoolEntry(body.ID); entry != nil && entry.Enabled {
-			proxyURL = config.SourceIPTransportURL(entry.SourceIP)
-			if proxyURL == "" {
-				proxyURL = strings.TrimSpace(entry.URL)
-			}
-		}
+		proxyURL = config.ResolveProxyURLFromEntries(usage.ListProxyPool(), body.ID, "", "")
 	}
 	if proxyURL == "" && h != nil && h.cfg != nil {
 		proxyURL = h.cfg.ResolveProxyURL(body.ID, "")

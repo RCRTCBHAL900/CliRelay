@@ -1,11 +1,13 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
 	"net"
 	"net/url"
+	"sort"
 	"strings"
 	"unicode"
 )
@@ -19,6 +21,8 @@ type ProxyPoolEntry struct {
 	Enabled     bool   `yaml:"enabled" json:"enabled"`
 	Description string `yaml:"description,omitempty" json:"description,omitempty"`
 }
+
+var discoverAutomaticSourceIPs = discoverHostPublicIPv4s
 
 // ValidateProxyURL verifies that a proxy URL can be used by the shared transport builders.
 func ValidateProxyURL(raw string) error {
@@ -36,6 +40,8 @@ func ValidateProxyURL(raw string) error {
 	switch strings.ToLower(parsed.Scheme) {
 	case "http", "https", "socks5":
 		return nil
+	case "sourceip":
+		return ValidateSourceIP(parsed.Host)
 	default:
 		return fmt.Errorf("unsupported proxy scheme: %s", parsed.Scheme)
 	}
@@ -71,7 +77,9 @@ func NormalizeProxyPool(entries []ProxyPoolEntry) []ProxyPoolEntry {
 		entry.SourceIP = strings.TrimSpace(entry.SourceIP)
 		entry.Description = strings.TrimSpace(entry.Description)
 		if entry.URL == "" && entry.SourceIP == "" {
-			continue
+			if !isAutomaticSourceIPLaneEntry(entry) {
+				continue
+			}
 		}
 		if entry.URL != "" && ValidateProxyURL(entry.URL) != nil {
 			continue
@@ -110,19 +118,83 @@ func (cfg *Config) SanitizeProxyPool() {
 	cfg.ProxyPool = NormalizeProxyPool(cfg.ProxyPool)
 }
 
-// ResolveProxyURL returns the effective proxy URL for a proxy-id plus legacy fallback URL.
-func (cfg *Config) ResolveProxyURL(proxyID string, fallbackURL string) string {
-	if cfg != nil {
-		id := normalizeProxyID(proxyID)
-		if id != "" {
-			for _, entry := range cfg.ProxyPool {
-				if entry.Enabled && normalizeProxyID(entry.ID) == id {
-					if strings.TrimSpace(entry.SourceIP) != "" {
-						return SourceIPTransportURL(entry.SourceIP)
-					}
-					if strings.TrimSpace(entry.URL) != "" {
-						return strings.TrimSpace(entry.URL)
-					}
+// RealizeProxyPoolEntries expands operator-managed automatic source-IP lanes into concrete source IPs.
+func RealizeProxyPoolEntries(entries []ProxyPoolEntry) []ProxyPoolEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	out := make([]ProxyPoolEntry, len(entries))
+	copy(out, entries)
+
+	automaticIndexes := make([]int, 0, len(out))
+	usedSourceIPs := make(map[string]struct{}, len(out))
+	for idx, entry := range out {
+		if sourceIP := strings.TrimSpace(entry.SourceIP); sourceIP != "" {
+			usedSourceIPs[sourceIP] = struct{}{}
+		}
+		if isAutomaticSourceIPLaneEntry(entry) {
+			automaticIndexes = append(automaticIndexes, idx)
+		}
+	}
+	if len(automaticIndexes) == 0 {
+		return out
+	}
+
+	candidates := make([]string, 0)
+	seenCandidates := make(map[string]struct{})
+	for _, sourceIP := range discoverAutomaticSourceIPs() {
+		trimmed := strings.TrimSpace(sourceIP)
+		if ValidateSourceIP(trimmed) != nil || !isPublicIPv4(trimmed) {
+			continue
+		}
+		if _, exists := usedSourceIPs[trimmed]; exists {
+			continue
+		}
+		if _, exists := seenCandidates[trimmed]; exists {
+			continue
+		}
+		seenCandidates[trimmed] = struct{}{}
+		candidates = append(candidates, trimmed)
+	}
+	if len(candidates) == 0 {
+		return out
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return compareIPv4Strings(candidates[i], candidates[j]) < 0
+	})
+	sort.Slice(automaticIndexes, func(i, j int) bool {
+		left := normalizeProxyID(out[automaticIndexes[i]].ID)
+		right := normalizeProxyID(out[automaticIndexes[j]].ID)
+		if left != right {
+			return left < right
+		}
+		return automaticIndexes[i] < automaticIndexes[j]
+	})
+
+	for idx, entryIndex := range automaticIndexes {
+		if idx >= len(candidates) {
+			break
+		}
+		out[entryIndex].SourceIP = candidates[idx]
+	}
+
+	return out
+}
+
+// ResolveProxyURLFromEntries returns the effective proxy URL for a proxy-id using the provided entries.
+func ResolveProxyURLFromEntries(entries []ProxyPoolEntry, proxyID string, fallbackURL string, defaultURL string) string {
+	realizedEntries := RealizeProxyPoolEntries(entries)
+	id := normalizeProxyID(proxyID)
+	if id != "" {
+		for _, entry := range realizedEntries {
+			if entry.Enabled && normalizeProxyID(entry.ID) == id {
+				if strings.TrimSpace(entry.SourceIP) != "" {
+					return SourceIPTransportURL(entry.SourceIP)
+				}
+				if strings.TrimSpace(entry.URL) != "" {
+					return strings.TrimSpace(entry.URL)
 				}
 			}
 		}
@@ -130,10 +202,15 @@ func (cfg *Config) ResolveProxyURL(proxyID string, fallbackURL string) string {
 	if fallback := strings.TrimSpace(fallbackURL); fallback != "" {
 		return fallback
 	}
-	if cfg != nil {
-		return strings.TrimSpace(cfg.ProxyURL)
+	return strings.TrimSpace(defaultURL)
+}
+
+// ResolveProxyURL returns the effective proxy URL for a proxy-id plus legacy fallback URL.
+func (cfg *Config) ResolveProxyURL(proxyID string, fallbackURL string) string {
+	if cfg == nil {
+		return strings.TrimSpace(fallbackURL)
 	}
-	return ""
+	return ResolveProxyURLFromEntries(cfg.ProxyPool, proxyID, fallbackURL, cfg.ProxyURL)
 }
 
 func normalizeProxyID(raw string) string {
@@ -173,4 +250,83 @@ func SourceIPTransportURL(raw string) string {
 		return ""
 	}
 	return "sourceip://" + trimmed
+}
+
+func isAutomaticSourceIPLaneEntry(entry ProxyPoolEntry) bool {
+	if strings.TrimSpace(entry.URL) != "" || strings.TrimSpace(entry.SourceIP) != "" {
+		return false
+	}
+	id := normalizeProxyID(entry.ID)
+	if id == "" {
+		id = normalizeProxyID(entry.Name)
+	}
+	return strings.HasPrefix(id, "claude-lane-")
+}
+
+func discoverHostPublicIPv4s() []string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, iface := range interfaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch typed := addr.(type) {
+			case *net.IPNet:
+				ip = typed.IP
+			case *net.IPAddr:
+				ip = typed.IP
+			default:
+				continue
+			}
+			ip = ip.To4()
+			if ip == nil {
+				continue
+			}
+			raw := ip.String()
+			if !isPublicIPv4(raw) {
+				continue
+			}
+			if _, exists := seen[raw]; exists {
+				continue
+			}
+			seen[raw] = struct{}{}
+			out = append(out, raw)
+		}
+	}
+	return out
+}
+
+func isPublicIPv4(raw string) bool {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	if ip == nil {
+		return false
+	}
+	ip = ip.To4()
+	if ip == nil || !ip.IsGlobalUnicast() || ip.IsLoopback() || ip.IsPrivate() || ip.IsMulticast() {
+		return false
+	}
+	// Exclude CGNAT 100.64.0.0/10 and link-local 169.254.0.0/16.
+	if ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127 {
+		return false
+	}
+	if ip[0] == 169 && ip[1] == 254 {
+		return false
+	}
+	return true
+}
+
+func compareIPv4Strings(left string, right string) int {
+	leftIP := net.ParseIP(strings.TrimSpace(left)).To4()
+	rightIP := net.ParseIP(strings.TrimSpace(right)).To4()
+	if leftIP == nil || rightIP == nil {
+		return strings.Compare(left, right)
+	}
+	return bytes.Compare(leftIP, rightIP)
 }

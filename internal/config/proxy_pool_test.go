@@ -11,12 +11,13 @@ func TestNormalizeProxyPoolTrimsDeduplicatesAndValidatesEntries(t *testing.T) {
 		{ID: "bad", Name: "bad", URL: "ftp://127.0.0.1:21", Enabled: true},
 		{ID: "", Name: "auto id", URL: "https://proxy.example.com:8443", Enabled: true},
 		{ID: "", Name: "direct", SourceIP: " 152.89.86.108 ", Enabled: true},
+		{ID: "claude-lane-01", Name: "Claude Lane 01", Enabled: true},
 	}
 
 	got := NormalizeProxyPool(input)
 
-	if len(got) != 3 {
-		t.Fatalf("NormalizeProxyPool length = %d, want 3: %#v", len(got), got)
+	if len(got) != 4 {
+		t.Fatalf("NormalizeProxyPool length = %d, want 4: %#v", len(got), got)
 	}
 	if got[0].ID != "hk-1" || got[0].Name != "HK 1" || got[0].URL != "socks5://user:pass@127.0.0.1:1080" || got[0].Description != "primary" {
 		t.Fatalf("first normalized entry = %#v", got[0])
@@ -27,6 +28,9 @@ func TestNormalizeProxyPoolTrimsDeduplicatesAndValidatesEntries(t *testing.T) {
 	if got[2].ID != "source-ip-152-89-86-108" || got[2].SourceIP != "152.89.86.108" {
 		t.Fatalf("third normalized entry = %#v", got[2])
 	}
+	if got[3].ID != "claude-lane-01" || got[3].SourceIP != "" || got[3].URL != "" {
+		t.Fatalf("fourth normalized entry = %#v", got[3])
+	}
 }
 
 func TestValidateProxyURLAllowsSupportedSchemesOnly(t *testing.T) {
@@ -36,6 +40,7 @@ func TestValidateProxyURLAllowsSupportedSchemesOnly(t *testing.T) {
 		"http://127.0.0.1:7890",
 		"https://proxy.example.com:8443",
 		"socks5://user:pass@127.0.0.1:1080",
+		"sourceip://152.89.86.108",
 	} {
 		if err := ValidateProxyURL(raw); err != nil {
 			t.Fatalf("ValidateProxyURL(%q) returned error: %v", raw, err)
@@ -96,5 +101,60 @@ func TestResolveProxyURLUsesProxyIDBeforeFallback(t *testing.T) {
 				t.Fatalf("ResolveProxyURL() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRealizeProxyPoolEntriesAutoBindsBlankClaudeLanes(t *testing.T) {
+	previousDiscoverer := discoverAutomaticSourceIPs
+	discoverAutomaticSourceIPs = func() []string {
+		return []string{
+			"10.98.0.5",
+			"204.168.157.78",
+			"65.109.249.42",
+			"65.109.249.3",
+			"65.109.249.42",
+		}
+	}
+	t.Cleanup(func() {
+		discoverAutomaticSourceIPs = previousDiscoverer
+	})
+
+	entries := []ProxyPoolEntry{
+		{ID: "claude-lane-02", Name: "Claude Lane 02", Enabled: true},
+		{ID: "claude-lane-01", Name: "Claude Lane 01", Enabled: true},
+		{ID: "explicit", Name: "Explicit", SourceIP: "65.109.249.3", Enabled: true},
+	}
+
+	got := RealizeProxyPoolEntries(entries)
+
+	if got[0].SourceIP != "204.168.157.78" {
+		t.Fatalf("lane 02 source ip = %q, want %q", got[0].SourceIP, "204.168.157.78")
+	}
+	if got[1].SourceIP != "65.109.249.42" {
+		t.Fatalf("lane 01 source ip = %q, want %q", got[1].SourceIP, "65.109.249.42")
+	}
+	if got[2].SourceIP != "65.109.249.3" {
+		t.Fatalf("explicit source ip = %q, want %q", got[2].SourceIP, "65.109.249.3")
+	}
+}
+
+func TestResolveProxyURLAutoRealizesClaudeLaneEntries(t *testing.T) {
+	previousDiscoverer := discoverAutomaticSourceIPs
+	discoverAutomaticSourceIPs = func() []string {
+		return []string{"65.109.249.42"}
+	}
+	t.Cleanup(func() {
+		discoverAutomaticSourceIPs = previousDiscoverer
+	})
+
+	cfg := &Config{
+		SDKConfig: SDKConfig{ProxyURL: "http://global.example:7890"},
+		ProxyPool: []ProxyPoolEntry{
+			{ID: "claude-lane-01", Name: "Claude Lane 01", Enabled: true},
+		},
+	}
+
+	if got := cfg.ResolveProxyURL("claude-lane-01", ""); got != "sourceip://65.109.249.42" {
+		t.Fatalf("ResolveProxyURL() = %q, want %q", got, "sourceip://65.109.249.42")
 	}
 }

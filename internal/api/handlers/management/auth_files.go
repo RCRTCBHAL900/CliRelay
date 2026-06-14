@@ -1652,6 +1652,7 @@ func (h *Handler) listEnabledProxyPoolEntries() []config.ProxyPoolEntry {
 	} else if h != nil && h.cfg != nil {
 		entries = append(entries, h.cfg.ProxyPool...)
 	}
+	entries = config.RealizeProxyPoolEntries(entries)
 	out := make([]config.ProxyPoolEntry, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.Enabled {
