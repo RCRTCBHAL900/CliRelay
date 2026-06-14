@@ -15,6 +15,7 @@ import (
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -100,6 +101,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	defer reporter.trackFailure(ctx, &err)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
+	clientUserAgent := getClientUserAgent(ctx)
 	// Use streaming translation to preserve function calling, except for claude.
 	stream := from != to
 	originalPayloadSource := req.Payload
@@ -115,6 +117,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
+	body = rehydrateClaudeAssistantThinkingSignatures(body, baseModel)
 
 	claudeFP, claudeFPEnabled := claudeIdentityFingerprint(e.cfg)
 	claudeFPSessionID := ""
@@ -218,6 +221,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
+	if from == to {
+		data = sanitizeClaudeDirectResponseForCompatibility(data, baseModel, clientUserAgent)
+	}
 	if stream {
 		lines := bytes.Split(data, []byte("\n"))
 		for _, line := range lines {
@@ -262,6 +268,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	defer reporter.trackFailure(ctx, &err)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
+	clientUserAgent := getClientUserAgent(ctx)
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -275,6 +282,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return nil, err
 	}
+	body = rehydrateClaudeAssistantThinkingSignatures(body, baseModel)
 
 	claudeFP, claudeFPEnabled := claudeIdentityFingerprint(e.cfg)
 	claudeFPSessionID := ""
@@ -381,6 +389,23 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if from == to {
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
+			compat := newClaudeDirectStreamCompat(baseModel, clientUserAgent, func(line []byte) []byte {
+				if !skipAnthropic && isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
+					return stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
+				}
+				return line
+			})
+			eventBuf := make([][]byte, 0, 4)
+			flushEvent := func() {
+				if len(eventBuf) == 0 {
+					return
+				}
+				event := bytes.Join(eventBuf, []byte("\n"))
+				for _, processed := range compat.Process(event) {
+					out <- cliproxyexecutor.StreamChunk{Payload: processed}
+				}
+				eventBuf = eventBuf[:0]
+			}
 			for scanner.Scan() {
 				line := scanner.Bytes()
 				appendAPIResponseChunk(ctx, e.cfg, line)
@@ -388,14 +413,14 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if detail, ok := parseClaudeStreamUsage(line); ok {
 					reporter.publish(ctx, detail)
 				}
-				if !skipAnthropic && isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
-					line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
+				eventBuf = append(eventBuf, bytes.Clone(line))
+				if len(bytes.TrimSpace(line)) == 0 {
+					flushEvent()
 				}
-				// Forward the line as-is to preserve SSE format
-				cloned := make([]byte, len(line)+1)
-				copy(cloned, line)
-				cloned[len(line)] = '\n'
-				out <- cliproxyexecutor.StreamChunk{Payload: cloned}
+			}
+			flushEvent()
+			for _, processed := range compat.Flush() {
+				out <- cliproxyexecutor.StreamChunk{Payload: processed}
 			}
 			if errScan := scanner.Err(); errScan != nil {
 				recordAPIResponseError(ctx, e.cfg, errScan)
@@ -1092,6 +1117,216 @@ func stripClaudeToolPrefixFromStreamLine(line []byte, prefix string) []byte {
 		return append([]byte("data: "), updated...)
 	}
 	return updated
+}
+
+func shouldApplyClaudeSignatureCompatibility(userAgent string) bool {
+	ua := strings.ToLower(strings.TrimSpace(userAgent))
+	return strings.Contains(ua, "opencode/")
+}
+
+func rehydrateClaudeAssistantThinkingSignatures(payload []byte, modelName string) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return payload
+	}
+
+	messages.ForEach(func(messageIndex, message gjson.Result) bool {
+		if strings.TrimSpace(message.Get("role").String()) != "assistant" {
+			return true
+		}
+		content := message.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(contentIndex, part gjson.Result) bool {
+			if strings.TrimSpace(part.Get("type").String()) != "thinking" {
+				return true
+			}
+			thinkingText := strings.TrimSpace(thinking.GetThinkingText(part))
+			if thinkingText == "" {
+				return true
+			}
+			signature := strings.TrimSpace(part.Get("signature").String())
+			if cache.HasValidSignature(modelName, signature) {
+				cache.CacheSignature(modelName, thinkingText, signature)
+				return true
+			}
+			if cached := cache.GetCachedSignature(modelName, thinkingText); cache.HasValidSignature(modelName, cached) {
+				path := fmt.Sprintf("messages.%d.content.%d.signature", messageIndex.Int(), contentIndex.Int())
+				payload, _ = sjson.SetBytes(payload, path, cached)
+			}
+			return true
+		})
+		return true
+	})
+
+	return payload
+}
+
+func sanitizeClaudeDirectResponseForCompatibility(payload []byte, modelName, userAgent string) []byte {
+	if !shouldApplyClaudeSignatureCompatibility(userAgent) || len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+
+	content := gjson.GetBytes(payload, "content")
+	if !content.IsArray() {
+		return payload
+	}
+
+	parts := content.Array()
+	rewritten := make([]string, 0, len(parts))
+	for _, part := range parts {
+		partType := strings.TrimSpace(part.Get("type").String())
+		switch partType {
+		case "thinking":
+			thinkingText := strings.TrimSpace(thinking.GetThinkingText(part))
+			signature := strings.TrimSpace(part.Get("signature").String())
+			if thinkingText != "" && cache.HasValidSignature(modelName, signature) {
+				cache.CacheSignature(modelName, thinkingText, signature)
+			}
+			if thinkingText == "" {
+				continue
+			}
+			cleaned := []byte(part.Raw)
+			if signature != "" {
+				if updated, err := sjson.DeleteBytes(cleaned, "signature"); err == nil {
+					cleaned = updated
+				}
+			}
+			rewritten = append(rewritten, string(cleaned))
+		case "redacted_thinking":
+			continue
+		default:
+			rewritten = append(rewritten, part.Raw)
+		}
+	}
+
+	payload, _ = sjson.SetRawBytes(payload, "content", []byte("["+strings.Join(rewritten, ",")+"]"))
+	return payload
+}
+
+type claudeDirectStreamCompat struct {
+	modelName                string
+	applySignatureCompat     bool
+	stripToolPrefixTransform func([]byte) []byte
+	bufferedThinkingStart    []byte
+	forwardThinkingBlock     bool
+	currentThinkingText      strings.Builder
+}
+
+func newClaudeDirectStreamCompat(modelName, userAgent string, stripToolPrefixTransform func([]byte) []byte) *claudeDirectStreamCompat {
+	return &claudeDirectStreamCompat{
+		modelName:                modelName,
+		applySignatureCompat:     shouldApplyClaudeSignatureCompatibility(userAgent),
+		stripToolPrefixTransform: stripToolPrefixTransform,
+	}
+}
+
+func (c *claudeDirectStreamCompat) Flush() [][]byte {
+	if !c.applySignatureCompat {
+		return nil
+	}
+	c.resetThinkingState()
+	return nil
+}
+
+func (c *claudeDirectStreamCompat) Process(event []byte) [][]byte {
+	if len(event) == 0 {
+		return nil
+	}
+	if !c.applySignatureCompat {
+		return [][]byte{c.transformEvent(event)}
+	}
+
+	payload := sseEventPayload(event)
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return [][]byte{c.transformEvent(event)}
+	}
+
+	eventType := gjson.GetBytes(payload, "type").String()
+	switch eventType {
+	case "content_block_start":
+		if strings.TrimSpace(gjson.GetBytes(payload, "content_block.type").String()) == "thinking" {
+			c.bufferedThinkingStart = bytes.Clone(event)
+			c.forwardThinkingBlock = false
+			c.currentThinkingText.Reset()
+			return nil
+		}
+	case "content_block_delta":
+		deltaType := strings.TrimSpace(gjson.GetBytes(payload, "delta.type").String())
+		switch deltaType {
+		case "thinking_delta":
+			text := gjson.GetBytes(payload, "delta.thinking").String()
+			c.currentThinkingText.WriteString(text)
+			out := make([][]byte, 0, 2)
+			if len(c.bufferedThinkingStart) > 0 {
+				out = append(out, c.transformEvent(c.bufferedThinkingStart))
+				c.bufferedThinkingStart = nil
+			}
+			c.forwardThinkingBlock = true
+			out = append(out, c.transformEvent(event))
+			return out
+		case "signature_delta":
+			signature := strings.TrimSpace(gjson.GetBytes(payload, "delta.signature").String())
+			if c.currentThinkingText.Len() > 0 && cache.HasValidSignature(c.modelName, signature) {
+				cache.CacheSignature(c.modelName, c.currentThinkingText.String(), signature)
+			}
+			return nil
+		}
+	case "content_block_stop":
+		if len(c.bufferedThinkingStart) > 0 || c.forwardThinkingBlock {
+			if c.forwardThinkingBlock {
+				out := [][]byte{c.transformEvent(event)}
+				c.resetThinkingState()
+				return out
+			}
+			c.resetThinkingState()
+			return nil
+		}
+	}
+
+	return [][]byte{c.transformEvent(event)}
+}
+
+func (c *claudeDirectStreamCompat) transformEvent(event []byte) []byte {
+	if c == nil || c.stripToolPrefixTransform == nil {
+		return cloneSSEEvent(event)
+	}
+	lines := bytes.Split(event, []byte("\n"))
+	for i := range lines {
+		trimmed := bytes.TrimSpace(lines[i])
+		if len(trimmed) == 0 {
+			continue
+		}
+		lines[i] = bytes.TrimSuffix(c.stripToolPrefixTransform(lines[i]), []byte("\n"))
+	}
+	return bytes.Join(lines, []byte("\n"))
+}
+
+func (c *claudeDirectStreamCompat) resetThinkingState() {
+	c.bufferedThinkingStart = nil
+	c.forwardThinkingBlock = false
+	c.currentThinkingText.Reset()
+}
+
+func cloneSSEEvent(event []byte) []byte {
+	cloned := make([]byte, len(event))
+	copy(cloned, event)
+	return cloned
+}
+
+func sseEventPayload(event []byte) []byte {
+	lines := bytes.Split(event, []byte("\n"))
+	for _, line := range lines {
+		payload := jsonPayload(line)
+		if len(payload) > 0 {
+			return payload
+		}
+	}
+	return nil
 }
 
 // getClientUserAgent extracts the client User-Agent from the gin context.

@@ -11,7 +11,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -428,6 +431,133 @@ func TestStripClaudeToolPrefixFromStreamLine_WithToolReference(t *testing.T) {
 	}
 	if got := gjson.GetBytes(payload, "content_block.tool_name").String(); got != "beta" {
 		t.Fatalf("content_block.tool_name = %q, want %q", got, "beta")
+	}
+}
+
+func TestRehydrateClaudeAssistantThinkingSignatures_UsesCache(t *testing.T) {
+	cache.ClearSignatureCache("")
+	const modelName = "claude-opus-4-8"
+	const thinkingText = "trace this carefully"
+	const signature = "sig_123456789012345678901234567890123456789012345678901234567890"
+	cache.CacheSignature(modelName, thinkingText, signature)
+
+	input := []byte(`{
+		"messages":[
+			{"role":"assistant","content":[{"type":"thinking","thinking":"trace this carefully"}]}
+		]
+	}`)
+
+	out := rehydrateClaudeAssistantThinkingSignatures(input, modelName)
+	if got := gjson.GetBytes(out, "messages.0.content.0.signature").String(); got != signature {
+		t.Fatalf("messages.0.content.0.signature = %q, want %q", got, signature)
+	}
+}
+
+func TestSanitizeClaudeDirectResponseForCompatibility_DropsSignatureOnlyThinking(t *testing.T) {
+	cache.ClearSignatureCache("")
+	const modelName = "claude-opus-4-8"
+	input := []byte(`{
+		"content":[
+			{"type":"thinking","thinking":"","signature":"sig_123456789012345678901234567890123456789012345678901234567890"},
+			{"type":"text","text":"hello"}
+		]
+	}`)
+
+	out := sanitizeClaudeDirectResponseForCompatibility(input, modelName, "opencode/7.3.45 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14")
+	if got := len(gjson.GetBytes(out, "content").Array()); got != 1 {
+		t.Fatalf("content length = %d, want 1; payload=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "content.0.type").String(); got != "text" {
+		t.Fatalf("content.0.type = %q, want %q", got, "text")
+	}
+}
+
+func TestClaudeDirectStreamCompat_SuppressesSignatureOnlyThinkingForOpencode(t *testing.T) {
+	cache.ClearSignatureCache("")
+	compat := newClaudeDirectStreamCompat("claude-opus-4-8", "opencode/7.3.45 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14", func(line []byte) []byte {
+		return stripClaudeToolPrefixFromStreamLine(line, "proxy_")
+	})
+
+	start := []byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n")
+	sig := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_123456789012345678901234567890123456789012345678901234567890\"}}\n\n")
+	stop := []byte("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+	tool := []byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"proxy_Bash\",\"id\":\"tool_1\"}}\n\n")
+
+	if got := compat.Process(start); len(got) != 0 {
+		t.Fatalf("start produced %d events, want 0", len(got))
+	}
+	if got := compat.Process(sig); len(got) != 0 {
+		t.Fatalf("signature produced %d events, want 0", len(got))
+	}
+	if got := compat.Process(stop); len(got) != 0 {
+		t.Fatalf("stop produced %d events, want 0", len(got))
+	}
+
+	got := compat.Process(tool)
+	if len(got) != 1 {
+		t.Fatalf("tool produced %d events, want 1", len(got))
+	}
+	if bytes.Contains(got[0], []byte("signature_delta")) {
+		t.Fatalf("tool event unexpectedly contains signature_delta: %s", string(got[0]))
+	}
+	if !bytes.Contains(got[0], []byte(`"name":"Bash"`)) {
+		t.Fatalf("tool event did not strip tool prefix: %s", string(got[0]))
+	}
+}
+
+func TestClaudeExecutor_ExecuteStream_StripsSignatureOnlyThinkingForOpencode(t *testing.T) {
+	cache.ClearSignatureCache("")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: content_block_start\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n")
+		_, _ = io.WriteString(w, "event: content_block_delta\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_123456789012345678901234567890123456789012345678901234567890\"}}\n\n")
+		_, _ = io.WriteString(w, "event: content_block_stop\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+		_, _ = io.WriteString(w, "event: content_block_start\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"proxy_Bash\",\"id\":\"tool_1\"}}\n\n")
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"api_key":  "sk-ant-oat-test",
+			"base_url": server.URL,
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("User-Agent", "opencode/7.3.45 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14")
+	ginCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ginCtx.Request = req
+	ctx := context.WithValue(req.Context(), util.ContextKeyGin, ginCtx)
+
+	stream, err := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: []byte(`{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"}}`),
+	}, cliproxyexecutor.Options{
+		Stream:       true,
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var out bytes.Buffer
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		out.Write(chunk.Payload)
+	}
+
+	if bytes.Contains(out.Bytes(), []byte("signature_delta")) {
+		t.Fatalf("output still contains signature_delta: %s", out.String())
+	}
+	if !bytes.Contains(out.Bytes(), []byte(`"name":"Bash"`)) {
+		t.Fatalf("output did not strip tool prefix: %s", out.String())
 	}
 }
 
