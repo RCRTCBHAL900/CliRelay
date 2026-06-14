@@ -583,14 +583,20 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.store == nil {
+		m.mu.Unlock()
 		return nil
 	}
 	items, err := m.store.List(ctx)
 	if err != nil {
+		m.mu.Unlock()
 		return err
 	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		cfg = &internalconfig.Config{}
+	}
+	updatedAuths := normalizeLoadedClaudeProxyAssignments(cfg, items)
 	m.auths = make(map[string]*Auth, len(items))
 	for _, auth := range items {
 		if auth == nil || auth.ID == "" {
@@ -602,11 +608,11 @@ func (m *Manager) Load(ctx context.Context) error {
 		auth.LastFailureStatus = 0
 		m.auths[auth.ID] = auth.Clone()
 	}
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
-	if cfg == nil {
-		cfg = &internalconfig.Config{}
-	}
 	m.rebuildAPIKeyModelAliasLocked(cfg)
+	m.mu.Unlock()
+	for _, auth := range updatedAuths {
+		_ = m.persist(ctx, auth)
+	}
 	return nil
 }
 
