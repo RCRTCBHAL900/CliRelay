@@ -918,7 +918,6 @@ func (s *RoundRobinSelector) rememberedAffinityAvailableLocked(provider, model, 
 			return auth
 		}
 	}
-	delete(s.affinity, key)
 	return nil
 }
 
@@ -939,7 +938,9 @@ func (s *RoundRobinSelector) RememberAffinitySelection(provider, model, affinity
 	key := affinitySelectionKey(provider, model, affinity)
 	s.mu.Lock()
 	s.ensureAffinityKeyLocked(key, limit)
-	s.affinity[key] = authID
+	if remembered := strings.TrimSpace(s.affinity[key]); remembered == "" || remembered == authID {
+		s.affinity[key] = authID
+	}
 	s.mu.Unlock()
 }
 

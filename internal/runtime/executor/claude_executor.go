@@ -15,8 +15,8 @@ import (
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -1181,22 +1181,13 @@ func sanitizeClaudeDirectResponseForCompatibility(payload []byte, modelName, use
 	for _, part := range parts {
 		partType := strings.TrimSpace(part.Get("type").String())
 		switch partType {
-		case "thinking":
+		case "thinking", "reasoning":
 			thinkingText := strings.TrimSpace(thinking.GetThinkingText(part))
 			signature := strings.TrimSpace(part.Get("signature").String())
 			if thinkingText != "" && cache.HasValidSignature(modelName, signature) {
 				cache.CacheSignature(modelName, thinkingText, signature)
 			}
-			if thinkingText == "" {
-				continue
-			}
-			cleaned := []byte(part.Raw)
-			if signature != "" {
-				if updated, err := sjson.DeleteBytes(cleaned, "signature"); err == nil {
-					cleaned = updated
-				}
-			}
-			rewritten = append(rewritten, string(cleaned))
+			continue
 		case "redacted_thinking":
 			continue
 		default:
@@ -1249,7 +1240,7 @@ func (c *claudeDirectStreamCompat) Process(event []byte) [][]byte {
 	eventType := gjson.GetBytes(payload, "type").String()
 	switch eventType {
 	case "content_block_start":
-		if strings.TrimSpace(gjson.GetBytes(payload, "content_block.type").String()) == "thinking" {
+		if isClaudeAssistantThinkingPart(strings.TrimSpace(gjson.GetBytes(payload, "content_block.type").String())) {
 			c.bufferedThinkingStart = bytes.Clone(event)
 			c.forwardThinkingBlock = false
 			c.currentThinkingText.Reset()
@@ -1261,14 +1252,8 @@ func (c *claudeDirectStreamCompat) Process(event []byte) [][]byte {
 		case "thinking_delta":
 			text := gjson.GetBytes(payload, "delta.thinking").String()
 			c.currentThinkingText.WriteString(text)
-			out := make([][]byte, 0, 2)
-			if len(c.bufferedThinkingStart) > 0 {
-				out = append(out, c.transformEvent(c.bufferedThinkingStart))
-				c.bufferedThinkingStart = nil
-			}
 			c.forwardThinkingBlock = true
-			out = append(out, c.transformEvent(event))
-			return out
+			return nil
 		case "signature_delta":
 			signature := strings.TrimSpace(gjson.GetBytes(payload, "delta.signature").String())
 			if c.currentThinkingText.Len() > 0 && cache.HasValidSignature(c.modelName, signature) {
@@ -1278,11 +1263,6 @@ func (c *claudeDirectStreamCompat) Process(event []byte) [][]byte {
 		}
 	case "content_block_stop":
 		if len(c.bufferedThinkingStart) > 0 || c.forwardThinkingBlock {
-			if c.forwardThinkingBlock {
-				out := [][]byte{c.transformEvent(event)}
-				c.resetThinkingState()
-				return out
-			}
 			c.resetThinkingState()
 			return nil
 		}

@@ -831,6 +831,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		m.rememberAffinitySelection(opts.Metadata, provider, routeModel, auth.ID)
 
 		tried[auth.ID] = struct{}{}
 		released := false
@@ -853,7 +854,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
 		result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
 		if errExec != nil {
-			m.forgetAffinitySelection(opts.Metadata, provider, routeModel, auth.ID)
+			m.forgetAffinitySelectionOnError(opts.Metadata, provider, routeModel, auth.ID, errExec)
 			releaseAuth()
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, errCtx
@@ -903,6 +904,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		m.rememberAffinitySelection(opts.Metadata, provider, routeModel, auth.ID)
 
 		tried[auth.ID] = struct{}{}
 		released := false
@@ -924,7 +926,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		execReq.Model = m.applyAPIKeyModelAlias(auth, execReq.Model)
 		resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
 		if errExec != nil {
-			m.forgetAffinitySelection(opts.Metadata, provider, routeModel, auth.ID)
+			m.forgetAffinitySelectionOnError(opts.Metadata, provider, routeModel, auth.ID, errExec)
 			releaseAuth()
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return cliproxyexecutor.Response{}, errCtx
@@ -965,6 +967,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		m.rememberAffinitySelection(opts.Metadata, provider, routeModel, auth.ID)
 
 		tried[auth.ID] = struct{}{}
 		released := false
@@ -986,7 +989,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		execReq.Model = m.applyAPIKeyModelAlias(auth, execReq.Model)
 		streamResult, errStream := executor.ExecuteStream(execCtx, auth, execReq, opts)
 		if errStream != nil {
-			m.forgetAffinitySelection(opts.Metadata, provider, routeModel, auth.ID)
+			m.forgetAffinitySelectionOnError(opts.Metadata, provider, routeModel, auth.ID, errStream)
 			releaseAuth()
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -1017,7 +1020,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			for chunk := range streamChunks {
 				if chunk.Err != nil && !failed {
 					failed = true
-					m.forgetAffinitySelection(opts.Metadata, streamProvider, routeModel, streamAuth.ID)
+					m.forgetAffinitySelectionOnError(opts.Metadata, streamProvider, routeModel, streamAuth.ID, chunk.Err)
 					rerr := &Error{Message: chunk.Err.Error()}
 					if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 						rerr.HTTPStatus = se.StatusCode()
@@ -1210,6 +1213,32 @@ func (m *Manager) forgetAffinitySelection(meta map[string]any, provider, model, 
 	}
 	if recorder := m.affinitySelectionMemoryForMetadata(meta); recorder != nil {
 		recorder.ForgetAffinitySelection(provider, model, affinity, authID)
+	}
+}
+
+func (m *Manager) forgetAffinitySelectionOnError(meta map[string]any, provider, model, authID string, err error) {
+	if !shouldForgetAffinitySelectionAfterError(provider, err) {
+		return
+	}
+	m.forgetAffinitySelection(meta, provider, model, authID)
+}
+
+func shouldForgetAffinitySelectionAfterError(provider string, err error) bool {
+	if !strings.EqualFold(strings.TrimSpace(provider), "claude") || err == nil {
+		return false
+	}
+	statusCode := statusCodeFromError(err)
+	switch statusCode {
+	case http.StatusUnauthorized:
+		message := strings.ToLower(strings.TrimSpace(err.Error()))
+		return strings.Contains(message, "invalid bearer token") ||
+			strings.Contains(message, "invalid authentication credentials") ||
+			strings.Contains(message, "\"type\":\"authentication_error\"") ||
+			strings.Contains(message, "\"type\": \"authentication_error\"")
+	case http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound:
+		return true
+	default:
+		return false
 	}
 }
 

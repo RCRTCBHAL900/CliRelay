@@ -143,6 +143,43 @@ func (e *claudeAffinityFailoverExecutor) HttpRequest(context.Context, *Auth, *ht
 	return nil, &Error{Code: "not_implemented", Message: "HttpRequest not implemented", HTTPStatus: http.StatusNotImplemented}
 }
 
+type claudeTransientAffinityExecutor struct {
+	failAuthID string
+	failedOnce bool
+	calls      []string
+}
+
+func (e *claudeTransientAffinityExecutor) Identifier() string { return "claude" }
+
+func (e *claudeTransientAffinityExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.calls = append(e.calls, auth.ID)
+	if auth != nil && auth.ID == e.failAuthID && !e.failedOnce {
+		e.failedOnce = true
+		return cliproxyexecutor.Response{}, &Error{
+			Code:       "upstream_failed",
+			Message:    "bad gateway",
+			HTTPStatus: http.StatusBadGateway,
+		}
+	}
+	return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+}
+
+func (e *claudeTransientAffinityExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, &Error{Code: "not_implemented", Message: "ExecuteStream not implemented", HTTPStatus: http.StatusNotImplemented}
+}
+
+func (e *claudeTransientAffinityExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *claudeTransientAffinityExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{Payload: []byte(`{"counted":true}`)}, nil
+}
+
+func (e *claudeTransientAffinityExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, &Error{Code: "not_implemented", Message: "HttpRequest not implemented", HTTPStatus: http.StatusNotImplemented}
+}
+
 func TestManagerExecute_ClaudeAffinityRemembersSuccessfulMixedFailover(t *testing.T) {
 	t.Parallel()
 
@@ -196,6 +233,69 @@ func TestManagerExecute_ClaudeAffinityRemembersSuccessfulMixedFailover(t *testin
 	}
 	if got := strings.Join(executor.calls, ","); got != "a,b,b" {
 		t.Fatalf("second Execute() calls = %q, want a,b,b", got)
+	}
+}
+
+func TestManagerExecute_ClaudeAffinityKeepsOriginalBindingAcrossTransientFallback(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	manager := NewManager(nil, selector, nil)
+	executor := &claudeTransientAffinityExecutor{failAuthID: "a"}
+	manager.RegisterExecutor(executor)
+
+	auths := []*Auth{
+		{ID: "a", Provider: "claude", Status: StatusActive},
+		{ID: "b", Provider: "claude", Status: StatusActive},
+	}
+	for _, auth := range auths {
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, err)
+		}
+	}
+	reg := registry.GetGlobalRegistry()
+	for _, auth := range auths {
+		reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: "claude-opus-4-8", Created: time.Now().Unix()}})
+	}
+
+	affinity := ""
+	for i := 0; i < 256; i++ {
+		candidate := "tcb:claude-transient-user:" + strconv.Itoa(i)
+		picked := pickAffinityAvailable("claude", "claude-opus-4-8", candidate, auths)
+		if picked != nil && picked.ID == "a" {
+			affinity = candidate
+			break
+		}
+	}
+	if affinity == "" {
+		t.Fatal("failed to find affinity key that initially selects auth a")
+	}
+
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.AuthAffinityMetadataKey: affinity,
+		},
+	}
+
+	if _, err := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "claude-opus-4-8"}, opts); err != nil {
+		t.Fatalf("Execute() first error = %v", err)
+	}
+	if got := strings.Join(executor.calls, ","); got != "a,b" {
+		t.Fatalf("first Execute() calls = %q, want a,b", got)
+	}
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   "a",
+		Provider: "claude",
+		Model:    "claude-opus-4-8",
+		Success:  true,
+	})
+
+	if _, err := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "claude-opus-4-8"}, opts); err != nil {
+		t.Fatalf("Execute() second error = %v", err)
+	}
+	if got := strings.Join(executor.calls, ","); got != "a,b,a" {
+		t.Fatalf("second Execute() calls = %q, want a,b,a", got)
 	}
 }
 

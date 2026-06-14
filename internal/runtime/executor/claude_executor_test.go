@@ -472,19 +472,45 @@ func TestSanitizeClaudeDirectResponseForCompatibility_DropsSignatureOnlyThinking
 	}
 }
 
-func TestClaudeDirectStreamCompat_SuppressesSignatureOnlyThinkingForOpencode(t *testing.T) {
+func TestSanitizeClaudeDirectResponseForCompatibility_StripsAllThinkingForOpencode(t *testing.T) {
+	cache.ClearSignatureCache("")
+	const modelName = "claude-opus-4-8"
+	input := []byte(`{
+		"content":[
+			{"type":"thinking","thinking":"internal reasoning","signature":"sig_123456789012345678901234567890123456789012345678901234567890"},
+			{"type":"text","text":"hello"}
+		]
+	}`)
+
+	out := sanitizeClaudeDirectResponseForCompatibility(input, modelName, "opencode/7.3.45 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14")
+	if got := len(gjson.GetBytes(out, "content").Array()); got != 1 {
+		t.Fatalf("content length = %d, want 1; payload=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "content.0.type").String(); got != "text" {
+		t.Fatalf("content.0.type = %q, want text; payload=%s", got, string(out))
+	}
+	if bytes.Contains(out, []byte("thinking")) {
+		t.Fatalf("output still contains thinking block: %s", string(out))
+	}
+}
+
+func TestClaudeDirectStreamCompat_SuppressesThinkingBlocksForOpencode(t *testing.T) {
 	cache.ClearSignatureCache("")
 	compat := newClaudeDirectStreamCompat("claude-opus-4-8", "opencode/7.3.45 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14", func(line []byte) []byte {
 		return stripClaudeToolPrefixFromStreamLine(line, "proxy_")
 	})
 
 	start := []byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n")
+	thinkingDelta := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"internal reasoning\"}}\n\n")
 	sig := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_123456789012345678901234567890123456789012345678901234567890\"}}\n\n")
 	stop := []byte("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
 	tool := []byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"proxy_Bash\",\"id\":\"tool_1\"}}\n\n")
 
 	if got := compat.Process(start); len(got) != 0 {
 		t.Fatalf("start produced %d events, want 0", len(got))
+	}
+	if got := compat.Process(thinkingDelta); len(got) != 0 {
+		t.Fatalf("thinking delta produced %d events, want 0", len(got))
 	}
 	if got := compat.Process(sig); len(got) != 0 {
 		t.Fatalf("signature produced %d events, want 0", len(got))
@@ -500,6 +526,9 @@ func TestClaudeDirectStreamCompat_SuppressesSignatureOnlyThinkingForOpencode(t *
 	if bytes.Contains(got[0], []byte("signature_delta")) {
 		t.Fatalf("tool event unexpectedly contains signature_delta: %s", string(got[0]))
 	}
+	if bytes.Contains(got[0], []byte("thinking_delta")) || bytes.Contains(got[0], []byte(`"type":"thinking"`)) {
+		t.Fatalf("tool event unexpectedly contains thinking content: %s", string(got[0]))
+	}
 	if !bytes.Contains(got[0], []byte(`"name":"Bash"`)) {
 		t.Fatalf("tool event did not strip tool prefix: %s", string(got[0]))
 	}
@@ -511,6 +540,8 @@ func TestClaudeExecutor_ExecuteStream_StripsSignatureOnlyThinkingForOpencode(t *
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "event: content_block_start\n")
 		_, _ = io.WriteString(w, "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n")
+		_, _ = io.WriteString(w, "event: content_block_delta\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"internal reasoning\"}}\n\n")
 		_, _ = io.WriteString(w, "event: content_block_delta\n")
 		_, _ = io.WriteString(w, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_123456789012345678901234567890123456789012345678901234567890\"}}\n\n")
 		_, _ = io.WriteString(w, "event: content_block_stop\n")
@@ -555,6 +586,9 @@ func TestClaudeExecutor_ExecuteStream_StripsSignatureOnlyThinkingForOpencode(t *
 
 	if bytes.Contains(out.Bytes(), []byte("signature_delta")) {
 		t.Fatalf("output still contains signature_delta: %s", out.String())
+	}
+	if bytes.Contains(out.Bytes(), []byte("thinking_delta")) || bytes.Contains(out.Bytes(), []byte(`"type":"thinking"`)) {
+		t.Fatalf("output still contains thinking content: %s", out.String())
 	}
 	if !bytes.Contains(out.Bytes(), []byte(`"name":"Bash"`)) {
 		t.Fatalf("output did not strip tool prefix: %s", out.String())
