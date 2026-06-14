@@ -524,9 +524,29 @@ func authMaxInFlight(auth *Auth) int {
 		return val
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
-		return defaultClaudeMaxInFlightValue()
+		return defaultClaudeMaxInFlightForAuth(auth)
 	}
 	return 0
+}
+
+func defaultClaudeMaxInFlightForAuth(auth *Auth) int {
+	base := defaultClaudeMaxInFlightValue()
+	if base < 1 {
+		base = 1
+	}
+	if auth == nil {
+		return base
+	}
+	if authHasAnySettingKey(auth, "session", "cookies") {
+		return 1
+	}
+	if authHasAnySettingKey(auth, "refresh_token", "access_token") {
+		if base > 2 {
+			return 2
+		}
+		return base
+	}
+	return base
 }
 
 func authIntSetting(auth *Auth, keys ...string) (int, bool) {
@@ -611,6 +631,27 @@ func authBoolSetting(auth *Auth, keys ...string) (bool, bool) {
 		}
 	}
 	return false, false
+}
+
+func authHasAnySettingKey(auth *Auth, keys ...string) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Attributes != nil {
+		for _, key := range keys {
+			if _, ok := auth.Attributes[key]; ok {
+				return true
+			}
+		}
+	}
+	if auth.Metadata != nil {
+		for _, key := range keys {
+			if _, ok := auth.Metadata[key]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func authSelectionAffinity(meta map[string]any) string {

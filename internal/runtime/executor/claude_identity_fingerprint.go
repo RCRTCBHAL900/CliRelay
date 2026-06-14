@@ -129,16 +129,12 @@ func applyClaudeIdentityFingerprintPayload(auth *cliproxyauth.Auth, payload []by
 func applyClaudeFingerprintSystem(payload []byte, fp config.ClaudeIdentityFingerprintConfig) []byte {
 	system := gjson.GetBytes(payload, "system")
 	remaining := make([]map[string]any, 0)
-	appendText := func(text string, cache bool) {
+	appendText := func(text string) {
 		text = strings.TrimSpace(text)
 		if text == "" || isClaudeFingerprintBillingText(text) || isClaudeFingerprintPrefixText(text) {
 			return
 		}
-		block := map[string]any{"type": "text", "text": text}
-		if cache {
-			block["cache_control"] = map[string]string{"type": "ephemeral"}
-		}
-		remaining = append(remaining, block)
+		remaining = append(remaining, map[string]any{"type": "text", "text": text})
 	}
 	if system.IsArray() {
 		for _, item := range system.Array() {
@@ -152,16 +148,12 @@ func applyClaudeFingerprintSystem(payload []byte, fp config.ClaudeIdentityFinger
 			}
 		}
 	} else if system.Type == gjson.String {
-		appendText(system.String(), false)
+		appendText(system.String())
 	}
 
 	next := []map[string]any{
 		{"type": "text", "text": buildClaudeBillingHeader(payload, fp)},
-		{
-			"type":          "text",
-			"text":          "You are Claude Code, Anthropic's official CLI for Claude.",
-			"cache_control": map[string]string{"type": "ephemeral"},
-		},
+		{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
 	}
 	next = append(next, remaining...)
 	raw, err := json.Marshal(next)

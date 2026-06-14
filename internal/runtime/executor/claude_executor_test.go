@@ -140,6 +140,73 @@ func TestClaudeExecutor_AddsMissingIndependentCacheBreakpoints(t *testing.T) {
 	}
 }
 
+func TestClaudeExecutor_FingerprintKeepsSystemCacheOnLastInstruction(t *testing.T) {
+	var upstreamBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		upstreamBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-opus-4-8","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{
+		IdentityFingerprint: config.IdentityFingerprintConfig{
+			Claude: config.ClaudeIdentityFingerprintConfig{
+				Enabled:     true,
+				CLIVersion:  "2.1.88",
+				Entrypoint:  "cli",
+				SessionMode: "fixed",
+				SessionID:   "session-fixed-123",
+				DeviceID:    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			},
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"api_key":  "oauth-access-token",
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{
+			"type":         "claude",
+			"account_uuid": "account-uuid-123",
+		},
+	}
+	payload := []byte(`{
+		"model":"claude-opus-4-8",
+		"system":[
+			{"type":"text","text":"Project rules"},
+			{"type":"text","text":"Repository context"}
+		],
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"hello"}]}
+		]
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-opus-4-8",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if got := gjson.GetBytes(upstreamBody, "system.0.cache_control").Exists(); got {
+		t.Fatalf("billing header should not carry cache_control; body=%s", string(upstreamBody))
+	}
+	if got := gjson.GetBytes(upstreamBody, "system.1.cache_control").Exists(); got {
+		t.Fatalf("claude prefix should not carry cache_control when later system blocks exist; body=%s", string(upstreamBody))
+	}
+	if got := gjson.GetBytes(upstreamBody, "system.3.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("last system instruction cache_control = %q, want ephemeral; body=%s", got, string(upstreamBody))
+	}
+}
+
 func TestDecodeResponseBody_DecodesGzipWithoutHeader(t *testing.T) {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)

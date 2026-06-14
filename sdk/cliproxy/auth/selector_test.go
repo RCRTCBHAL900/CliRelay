@@ -52,6 +52,32 @@ func TestAuthMaxInFlight_ClaudeDefaultFallsBackOnInvalidEnv(t *testing.T) {
 	}
 }
 
+func TestAuthMaxInFlight_ClaudeLegacySessionDefaultsToOne(t *testing.T) {
+	t.Setenv("CLAUDE_DEFAULT_MAX_INFLIGHT", "2")
+	auth := &Auth{
+		Provider: "claude",
+		Metadata: map[string]any{
+			"session": "cookie-session",
+		},
+	}
+	if got := authMaxInFlight(auth); got != 1 {
+		t.Fatalf("authMaxInFlight() = %d, want 1 for legacy session auth", got)
+	}
+}
+
+func TestAuthMaxInFlight_ClaudeTokenDefaultRespectsEnvCap(t *testing.T) {
+	t.Setenv("CLAUDE_DEFAULT_MAX_INFLIGHT", "3")
+	auth := &Auth{
+		Provider: "claude",
+		Metadata: map[string]any{
+			"refresh_token": "refresh-token",
+		},
+	}
+	if got := authMaxInFlight(auth); got != 2 {
+		t.Fatalf("authMaxInFlight() = %d, want 2 for token auth", got)
+	}
+}
+
 func TestRoundRobinSelectorPick_CyclesDeterministic(t *testing.T) {
 	t.Parallel()
 
