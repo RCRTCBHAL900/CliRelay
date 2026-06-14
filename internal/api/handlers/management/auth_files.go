@@ -1586,6 +1586,9 @@ func (h *Handler) prepareManagedAuthFile(path string, data []byte) ([]byte, map[
 				}
 			}
 		}
+		if applyClaudeSafetyDefaults(metadata) {
+			changed = true
+		}
 	}
 	if !changed {
 		return data, metadata, false, nil
@@ -1665,6 +1668,10 @@ func (h *Handler) assignAutomaticClaudeProxyToRecord(record *coreauth.Auth) {
 	}
 	assigned := h.selectAutomaticProxyEntry(provider, authID)
 	if assigned == nil {
+		if record.Metadata == nil {
+			record.Metadata = make(map[string]any)
+		}
+		applyClaudeSafetyDefaults(record.Metadata)
 		return
 	}
 	if record.Metadata == nil {
@@ -1678,6 +1685,65 @@ func (h *Handler) assignAutomaticClaudeProxyToRecord(record *coreauth.Auth) {
 		record.ProxyURL = resolvedURL
 		record.Metadata["proxy_url"] = resolvedURL
 	}
+	applyClaudeSafetyDefaults(record.Metadata)
+}
+
+func applyClaudeSafetyDefaults(metadata map[string]any) bool {
+	if len(metadata) == 0 {
+		return false
+	}
+	provider := strings.ToLower(strings.TrimSpace(metadataString(metadata, "type", "provider")))
+	if provider != "claude" {
+		return false
+	}
+	changed := false
+	if !metadataHasAnyKey(metadata, "load_aware_scheduler", "load-aware-scheduler") {
+		metadata["load_aware_scheduler"] = true
+		changed = true
+	}
+	if !metadataHasAnyKey(
+		metadata,
+		"scheduler_max_inflight",
+		"scheduler-max-inflight",
+		"max_inflight",
+		"max-inflight",
+		"max_in_flight",
+		"concurrency_limit",
+		"concurrency-limit",
+	) {
+		metadata["concurrency_limit"] = defaultClaudeSafetyConcurrencyLimit(metadata)
+		changed = true
+	}
+	return changed
+}
+
+func metadataHasAnyKey(metadata map[string]any, keys ...string) bool {
+	if len(metadata) == 0 {
+		return false
+	}
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if _, ok := metadata[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func defaultClaudeSafetyConcurrencyLimit(metadata map[string]any) int {
+	if len(metadata) == 0 {
+		return 1
+	}
+	if metadataHasAnyKey(metadata, "session", "cookies") {
+		return 1
+	}
+	if metadataHasAnyKey(metadata, "refresh_token", "access_token") {
+		return 2
+	}
+	return 1
 }
 
 func (h *Handler) listEnabledProxyPoolEntries() []config.ProxyPoolEntry {
