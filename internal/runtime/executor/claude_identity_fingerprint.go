@@ -206,41 +206,15 @@ func applyClaudeFingerprintSystem(payload []byte, fp config.ClaudeIdentityFinger
 	return payload
 }
 
-func buildClaudeBillingHeader(payload []byte, fp config.ClaudeIdentityFingerprintConfig) string {
-	fingerprint := computeClaudeBillingFingerprint(firstClaudeUserMessageText(payload), fp.CLIVersion)
+func buildClaudeBillingHeader(_ []byte, fp config.ClaudeIdentityFingerprintConfig) string {
+	// Keep the synthetic billing block stable across requests so upstream prompt
+	// caching is not fragmented by user-message-specific variations.
+	fingerprint := computeClaudeBillingFingerprint(fp.CLIVersion, fp.Entrypoint)
 	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s;", fp.CLIVersion, fingerprint, fp.Entrypoint)
 }
 
-func firstClaudeUserMessageText(payload []byte) string {
-	messages := gjson.GetBytes(payload, "messages")
-	for _, msg := range messages.Array() {
-		if msg.Get("role").String() != "user" {
-			continue
-		}
-		content := msg.Get("content")
-		if content.Type == gjson.String {
-			return content.String()
-		}
-		if content.IsArray() {
-			for _, block := range content.Array() {
-				if block.Get("type").String() == "text" {
-					return block.Get("text").String()
-				}
-			}
-		}
-	}
-	return ""
-}
-
-func computeClaudeBillingFingerprint(messageText, version string) string {
-	chars := []rune(messageText)
-	pick := func(index int) rune {
-		if index >= 0 && index < len(chars) {
-			return chars[index]
-		}
-		return '0'
-	}
-	input := fmt.Sprintf("%s%c%c%c%s", claudeFingerprintSalt, pick(4), pick(7), pick(20), version)
+func computeClaudeBillingFingerprint(version, entrypoint string) string {
+	input := fmt.Sprintf("%s|%s|%s", claudeFingerprintSalt, strings.TrimSpace(version), strings.TrimSpace(entrypoint))
 	sum := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(sum[:])[:3]
 }

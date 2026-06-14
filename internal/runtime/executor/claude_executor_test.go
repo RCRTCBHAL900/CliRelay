@@ -777,6 +777,29 @@ func TestClaudeExecutorAppliesClaudeIdentityFingerprint(t *testing.T) {
 	}
 }
 
+func TestClaudeBillingHeader_IsStableAcrossUserMessages(t *testing.T) {
+	t.Parallel()
+
+	fp := config.ClaudeIdentityFingerprintConfig{
+		CLIVersion: "2.1.88",
+		Entrypoint: "cli",
+	}
+
+	payloadA := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello from the first prompt"}]}]}`)
+	payloadB := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"a completely different opener"}]}]}`)
+
+	gotA := buildClaudeBillingHeader(payloadA, fp)
+	gotB := buildClaudeBillingHeader(payloadB, fp)
+
+	if gotA != gotB {
+		t.Fatalf("billing header changed across user messages:\nA: %s\nB: %s", gotA, gotB)
+	}
+	if !strings.Contains(gotA, "x-anthropic-billing-header: cc_version=2.1.88.") ||
+		!strings.Contains(gotA, "cc_entrypoint=cli") {
+		t.Fatalf("billing header = %q, want stable Claude billing fingerprint", gotA)
+	}
+}
+
 func TestClaudeFingerprintSessionID_ServerStableUsesExecutionAndAffinity(t *testing.T) {
 	t.Parallel()
 
