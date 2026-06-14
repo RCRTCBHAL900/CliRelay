@@ -180,6 +180,49 @@ func TestClaudeExecutor_AddsMissingIndependentCacheBreakpoints(t *testing.T) {
 	}
 }
 
+func TestClaudeExecutor_SingleTurnPromptUsesExplicitUserCacheBreakpoint(t *testing.T) {
+	var upstreamBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		upstreamBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-haiku-4-5","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{
+		"model":"claude-haiku-4-5",
+		"messages":[
+			{"role":"user","content":"Single turn cache me"}
+		]
+	}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-haiku-4-5",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	if got := gjson.GetBytes(upstreamBody, "messages.0.content.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("single-turn message cache_control = %q, want ephemeral; body=%s", got, string(upstreamBody))
+	}
+	if got := gjson.GetBytes(upstreamBody, "cache_control").Exists(); got {
+		t.Fatalf("top-level cache_control should not be injected for single-turn prompt; body=%s", string(upstreamBody))
+	}
+}
+
 func TestClaudeExecutor_FingerprintKeepsSystemCacheOnLastInstruction(t *testing.T) {
 	var upstreamBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

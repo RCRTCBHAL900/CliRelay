@@ -166,8 +166,27 @@ func TestEnsureCacheControl(t *testing.T) {
 		}
 	})
 
-	// Test case 8: Conversation caching uses Anthropic's automatic top-level control
-	t.Run("Conversation Caching Uses Top Level Automatic Control", func(t *testing.T) {
+	// Test case 8: Single-turn prompts use an explicit last-user breakpoint
+	t.Run("Single Turn Prompt Uses Explicit User Breakpoint", func(t *testing.T) {
+		input := []byte(`{
+			"model": "claude-3-5-sonnet",
+			"messages": [
+				{"role": "user", "content": "Only user turn"}
+			]
+		}`)
+		output := ensureCacheControl(input)
+
+		cacheType := gjson.GetBytes(output, "messages.0.content.0.cache_control.type")
+		if cacheType.String() != "ephemeral" {
+			t.Errorf("message-level cache_control not found for single-turn prompt. Output: %s", string(output))
+		}
+		if topLevel := gjson.GetBytes(output, "cache_control"); topLevel.Exists() {
+			t.Errorf("top-level automatic cache_control should not be injected for single-turn prompt")
+		}
+	})
+
+	// Test case 9: Multi-turn conversation uses Anthropic's automatic top-level control
+	t.Run("Multi Turn Conversation Uses Top Level Automatic Control", func(t *testing.T) {
 		input := []byte(`{
 			"model": "claude-3-5-sonnet",
 			"messages": [
@@ -191,7 +210,7 @@ func TestEnsureCacheControl(t *testing.T) {
 		}
 	})
 
-	// Test case 9: Existing message cache_control should skip automatic injection
+	// Test case 10: Existing message cache_control should skip automatic injection
 	t.Run("Messages Skip Automatic Caching When Explicit Breakpoint Exists", func(t *testing.T) {
 		input := []byte(`{
 			"model": "claude-3-5-sonnet",
@@ -214,7 +233,7 @@ func TestEnsureCacheControl(t *testing.T) {
 		}
 	})
 
-	// Test case 10: Existing top-level automatic caching should be preserved
+	// Test case 11: Existing top-level automatic caching should be preserved
 	t.Run("Existing Top Level Automatic Caching Preserved", func(t *testing.T) {
 		input := []byte(`{
 			"model": "claude-3-5-sonnet",
