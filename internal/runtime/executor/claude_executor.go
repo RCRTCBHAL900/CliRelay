@@ -151,7 +151,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if !skipAnthropic {
 		if claudeFPEnabled {
 			claudeFPSessionID = claudeFingerprintSessionID(claudeFP)
-			body = applyClaudeIdentityFingerprintPayload(auth, body, claudeFP, claudeFPSessionID)
+			body = applyClaudeIdentityFingerprintPayload(auth, body, claudeFP)
 		} else {
 			body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
 		}
@@ -311,7 +311,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if !skipAnthropic {
 		if claudeFPEnabled {
 			claudeFPSessionID = claudeFingerprintSessionID(claudeFP)
-			body = applyClaudeIdentityFingerprintPayload(auth, body, claudeFP, claudeFPSessionID)
+			body = applyClaudeIdentityFingerprintPayload(auth, body, claudeFP)
 		} else {
 			body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
 		}
