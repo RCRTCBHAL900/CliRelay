@@ -1077,3 +1077,121 @@ func TestPatchAuthFileFieldsReturnsErrorWhenPersistenceFails(t *testing.T) {
 		t.Fatalf("expected in-memory auth rollback on persist failure, got channel=%q", updated.ChannelName())
 	}
 }
+
+func TestPatchAuthFileFieldsBackfillsClaudeSafetyDefaultsOnLegacySessionAuth(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	_, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "legacy-claude-auth",
+		FileName: "legacy-claude-auth.json",
+		Provider: "claude",
+		Label:    "Legacy Claude",
+		Metadata: map[string]any{
+			"email":   "legacy-claude@example.com",
+			"session": "cookie-session",
+		},
+	})
+	if err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	h := &Handler{
+		cfg:         &config.Config{},
+		authManager: manager,
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"name":  "legacy-claude-auth.json",
+		"label": "Legacy Claude Updated",
+	})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPatch, "/auth-files/fields", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PatchAuthFileFields(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d, body=%s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("legacy-claude-auth")
+	if !ok || updated == nil {
+		t.Fatal("expected updated auth")
+	}
+	if updated.Label != "Legacy Claude Updated" {
+		t.Fatalf("label = %q, want %q", updated.Label, "Legacy Claude Updated")
+	}
+	if got, _ := updated.Metadata["type"].(string); got != "claude" {
+		t.Fatalf("metadata type = %#v, want %q", updated.Metadata["type"], "claude")
+	}
+	if got, _ := updated.Metadata["load_aware_scheduler"].(bool); !got {
+		t.Fatalf("metadata load_aware_scheduler = %#v, want true", updated.Metadata["load_aware_scheduler"])
+	}
+	if got, ok := updated.Metadata["concurrency_limit"].(int); !ok || got != 1 {
+		t.Fatalf("metadata concurrency_limit = %#v, want 1", updated.Metadata["concurrency_limit"])
+	}
+}
+
+func TestPatchAuthFileFieldsPreservesExplicitClaudeSafetyOverrides(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	_, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "legacy-claude-auth-explicit",
+		FileName: "legacy-claude-auth-explicit.json",
+		Provider: "claude",
+		Label:    "Legacy Claude Explicit",
+		Metadata: map[string]any{
+			"email":                "legacy-claude-explicit@example.com",
+			"type":                 "claude",
+			"load_aware_scheduler": false,
+			"concurrency_limit":    4,
+		},
+	})
+	if err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	h := &Handler{
+		cfg:         &config.Config{},
+		authManager: manager,
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"name":  "legacy-claude-auth-explicit.json",
+		"label": "Legacy Claude Explicit Updated",
+	})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPatch, "/auth-files/fields", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PatchAuthFileFields(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d, body=%s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("legacy-claude-auth-explicit")
+	if !ok || updated == nil {
+		t.Fatal("expected updated auth")
+	}
+	if got, _ := updated.Metadata["load_aware_scheduler"].(bool); got {
+		t.Fatalf("metadata load_aware_scheduler = %#v, want false override preserved", updated.Metadata["load_aware_scheduler"])
+	}
+	if got, ok := updated.Metadata["concurrency_limit"].(int); !ok || got != 4 {
+		t.Fatalf("metadata concurrency_limit = %#v, want 4 override preserved", updated.Metadata["concurrency_limit"])
+	}
+}

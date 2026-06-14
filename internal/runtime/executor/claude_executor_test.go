@@ -37,6 +37,57 @@ func TestApplyClaudeToolPrefix(t *testing.T) {
 	}
 }
 
+func TestEnsureClaudeThinkingDisplay(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		input       string
+		wantDisplay string
+		wantExists  bool
+	}{
+		{
+			name:        "enabled defaults to summarized",
+			input:       `{"thinking":{"type":"enabled","budget_tokens":2048}}`,
+			wantDisplay: "summarized",
+			wantExists:  true,
+		},
+		{
+			name:        "adaptive defaults to summarized",
+			input:       `{"thinking":{"type":"adaptive"}}`,
+			wantDisplay: "summarized",
+			wantExists:  true,
+		},
+		{
+			name:        "explicit display preserved",
+			input:       `{"thinking":{"type":"enabled","display":"full"}}`,
+			wantDisplay: "full",
+			wantExists:  true,
+		},
+		{
+			name:       "disabled removes display",
+			input:      `{"thinking":{"type":"disabled","display":"summarized"}}`,
+			wantExists: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			out := ensureClaudeThinkingDisplay([]byte(tt.input))
+			display := gjson.GetBytes(out, "thinking.display")
+			if display.Exists() != tt.wantExists {
+				t.Fatalf("thinking.display exists = %v, want %v; payload=%s", display.Exists(), tt.wantExists, string(out))
+			}
+			if tt.wantExists && display.String() != tt.wantDisplay {
+				t.Fatalf("thinking.display = %q, want %q; payload=%s", display.String(), tt.wantDisplay, string(out))
+			}
+		})
+	}
+}
+
 func TestClaudeExecutor_AddsMissingIndependentCacheBreakpoints(t *testing.T) {
 	var upstreamBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

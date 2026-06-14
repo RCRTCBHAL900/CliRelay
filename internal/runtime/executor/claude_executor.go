@@ -137,6 +137,11 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 		body = disableThinkingIfToolChoiceForced(body)
 
+		// Some Claude clients enable adaptive/extended thinking without specifying a
+		// display mode. Defaulting to summarized avoids downstream clients rendering
+		// signature-only thinking blocks as junk while preserving caller overrides.
+		body = ensureClaudeThinkingDisplay(body)
+
 		// Fill in any missing independent cache breakpoints for tools/system/messages.
 		body = ensureCacheControl(body)
 	}
@@ -290,6 +295,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if !skipAnthropic {
 		// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 		body = disableThinkingIfToolChoiceForced(body)
+
+		// Some Claude clients enable adaptive/extended thinking without specifying a
+		// display mode. Defaulting to summarized avoids downstream clients rendering
+		// signature-only thinking blocks as junk while preserving caller overrides.
+		body = ensureClaudeThinkingDisplay(body)
 
 		// Fill in any missing independent cache breakpoints for tools/system/messages.
 		body = ensureCacheControl(body)
@@ -1285,6 +1295,22 @@ func ensureCacheControl(payload []byte) []byte {
 	// This caches the conversation history up to the second-to-last user turn.
 	payload = injectMessagesCacheControl(payload)
 
+	return payload
+}
+
+func ensureClaudeThinkingDisplay(payload []byte) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "thinking.type").String()))
+	switch thinkingType {
+	case "enabled", "adaptive":
+		if strings.TrimSpace(gjson.GetBytes(payload, "thinking.display").String()) == "" {
+			payload, _ = sjson.SetBytes(payload, "thinking.display", "summarized")
+		}
+	case "disabled":
+		payload, _ = sjson.DeleteBytes(payload, "thinking.display")
+	}
 	return payload
 }
 

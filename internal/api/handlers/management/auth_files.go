@@ -2120,6 +2120,23 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		changed = true
 	}
 
+	provider := strings.ToLower(strings.TrimSpace(targetAuth.Provider))
+	if provider == "" {
+		provider = strings.ToLower(strings.TrimSpace(metadataString(targetAuth.Metadata, "type", "provider")))
+	}
+	if provider == "claude" {
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if strings.TrimSpace(metadataString(targetAuth.Metadata, "type", "provider")) == "" {
+			targetAuth.Metadata["type"] = "claude"
+			changed = true
+		}
+		if applyClaudeSafetyDefaults(targetAuth.Metadata) {
+			changed = true
+		}
+	}
+
 	if !changed {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
 		return
