@@ -446,6 +446,45 @@ func TestBuildAuthFileEntryIncludesActiveRestrictions(t *testing.T) {
 	}
 }
 
+func TestBuildAuthFileEntrySanitizesBinaryStatusMessage(t *testing.T) {
+	nextRetry := time.Now().Add(10 * time.Minute).UTC().Truncate(time.Second)
+	auth := &coreauth.Auth{
+		ID:       "claude-gzip-error",
+		FileName: "claude-gzip-error.json",
+		Provider: "claude",
+		Status:   coreauth.StatusError,
+		Attributes: map[string]string{
+			"path": "claude-gzip-error.json",
+		},
+		ModelStates: map[string]*coreauth.ModelState{
+			"claude-opus-4-8": {
+				Status:         coreauth.StatusError,
+				StatusMessage:  "\x1f\ufffd\b\u0000garbled",
+				Unavailable:    true,
+				NextRetryAfter: nextRetry,
+				LastError:      &coreauth.Error{Message: "\x1f\ufffd\b\u0000garbled", HTTPStatus: http.StatusTooManyRequests},
+				Quota: coreauth.QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: nextRetry,
+				},
+			},
+		},
+	}
+
+	entry := (&Handler{}).buildAuthFileEntry(auth)
+	if entry == nil {
+		t.Fatal("expected auth file entry")
+	}
+	restrictions, ok := entry["restrictions"].([]gin.H)
+	if !ok || len(restrictions) != 1 {
+		t.Fatalf("restrictions = %#v", entry["restrictions"])
+	}
+	if got := restrictions[0]["status_message"]; got != "quota exhausted" {
+		t.Fatalf("status_message = %#v, want quota exhausted", got)
+	}
+}
+
 func TestBuildAuthFileEntryDedupesDuplicateRestrictions(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	nextRetry := now.Add(25 * time.Minute)

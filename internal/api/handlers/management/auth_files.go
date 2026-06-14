@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/bodyutil"
@@ -778,7 +779,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"provider":       strings.TrimSpace(auth.Provider),
 		"label":          auth.ChannelName(),
 		"status":         auth.Status,
-		"status_message": auth.StatusMessage,
+		"status_message": sanitizeAuthStatusMessage(auth.StatusMessage, auth.LastError, auth.Quota),
 		"disabled":       auth.Disabled,
 		"unavailable":    auth.Unavailable,
 		"runtime_only":   runtimeOnly,
@@ -1026,6 +1027,7 @@ func buildRestrictionEntry(scope, model string, status coreauth.Status, statusMe
 	if statusMessage == "" && lastError != nil {
 		statusMessage = strings.TrimSpace(lastError.Message)
 	}
+	statusMessage = sanitizeAuthStatusMessage(statusMessage, lastError, quota)
 	if statusMessage != "" {
 		entry["status_message"] = statusMessage
 	}
@@ -1060,6 +1062,59 @@ func isActiveRestriction(status coreauth.Status, unavailable bool, nextRetryAfte
 	hasActiveRetry := !nextRetryAfter.IsZero() && nextRetryAfter.After(now)
 	hasActiveQuota := quota.Exceeded && (quota.NextRecoverAt.IsZero() || quota.NextRecoverAt.After(now))
 	return hasErrorState || hasActiveRetry || hasActiveQuota
+}
+
+func sanitizeAuthStatusMessage(statusMessage string, lastError *coreauth.Error, quota coreauth.QuotaState) string {
+	statusMessage = strings.TrimSpace(statusMessage)
+	if statusMessage == "" {
+		return ""
+	}
+	if !looksLikeBinaryStatusMessage(statusMessage) {
+		return statusMessage
+	}
+	if lastError != nil {
+		switch lastError.HTTPStatus {
+		case http.StatusUnauthorized:
+			return "unauthorized"
+		case http.StatusPaymentRequired, http.StatusForbidden:
+			return "payment_required"
+		case http.StatusNotFound:
+			return "not_found"
+		case http.StatusTooManyRequests:
+			return "quota exhausted"
+		case http.StatusRequestTimeout, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return "transient upstream error"
+		}
+	}
+	if quota.Exceeded {
+		return "quota exhausted"
+	}
+	return "upstream request failed"
+}
+
+func looksLikeBinaryStatusMessage(statusMessage string) bool {
+	if statusMessage == "" {
+		return false
+	}
+	if strings.ContainsRune(statusMessage, '\uFFFD') {
+		return true
+	}
+	controlCount := 0
+	for _, r := range statusMessage {
+		if r == '\n' || r == '\r' || r == '\t' {
+			continue
+		}
+		if unicode.IsControl(r) {
+			controlCount++
+			if controlCount >= 2 {
+				return true
+			}
+		}
+	}
+	if !utf8.ValidString(statusMessage) {
+		return true
+	}
+	return strings.HasPrefix(statusMessage, "\x1f")
 }
 
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
