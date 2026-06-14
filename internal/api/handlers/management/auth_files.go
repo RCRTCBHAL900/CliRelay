@@ -1589,7 +1589,17 @@ func (h *Handler) assignAutomaticClaudeProxyToRecord(record *coreauth.Auth) {
 	if provider != "claude" {
 		return
 	}
+	if record.Metadata == nil {
+		record.Metadata = make(map[string]any)
+	}
 	if strings.TrimSpace(record.ProxyID) != "" || strings.TrimSpace(record.ProxyURL) != "" {
+		if strings.TrimSpace(record.ProxyID) != "" {
+			record.Metadata["proxy_id"] = strings.TrimSpace(record.ProxyID)
+		}
+		if strings.TrimSpace(record.ProxyURL) != "" {
+			record.Metadata["proxy_url"] = strings.TrimSpace(record.ProxyURL)
+		}
+		applyClaudeSafetyDefaults(record.Metadata)
 		return
 	}
 	authID := strings.TrimSpace(record.ID)
@@ -1598,14 +1608,8 @@ func (h *Handler) assignAutomaticClaudeProxyToRecord(record *coreauth.Auth) {
 	}
 	assigned := h.selectAutomaticProxyEntry(provider, authID)
 	if assigned == nil {
-		if record.Metadata == nil {
-			record.Metadata = make(map[string]any)
-		}
 		applyClaudeSafetyDefaults(record.Metadata)
 		return
-	}
-	if record.Metadata == nil {
-		record.Metadata = make(map[string]any)
 	}
 	if assignedID := strings.TrimSpace(assigned.ID); assignedID != "" {
 		record.ProxyID = assignedID
@@ -2219,6 +2223,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")
 	}
+	h.assignAutomaticClaudeProxyToRecord(record)
 	if h.postAuthHook != nil {
 		if err := h.postAuthHook(ctx, record); err != nil {
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
