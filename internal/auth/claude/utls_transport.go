@@ -3,10 +3,12 @@
 package claude
 
 import (
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	tls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -39,11 +41,19 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 		if err != nil {
 			log.Errorf("failed to parse proxy URL %q: %v", cfg.ProxyURL, err)
 		} else {
-			pDialer, err := proxy.FromURL(proxyURL, proxy.Direct)
-			if err != nil {
-				log.Errorf("failed to create proxy dialer for %q: %v", cfg.ProxyURL, err)
+			if strings.EqualFold(proxyURL.Scheme, util.SourceIPProxyScheme) {
+				if sourceDialer, errSource := newSourceIPDialer(proxyURL.Host, cfg.PreferIPv4); errSource != nil {
+					log.Errorf("failed to create source ip dialer for %q: %v", cfg.ProxyURL, errSource)
+				} else {
+					dialer = sourceDialer
+				}
 			} else {
-				dialer = pDialer
+				pDialer, err := proxy.FromURL(proxyURL, proxy.Direct)
+				if err != nil {
+					log.Errorf("failed to create proxy dialer for %q: %v", cfg.ProxyURL, err)
+				} else {
+					dialer = pDialer
+				}
 			}
 		}
 	}
@@ -170,4 +180,37 @@ func NewAnthropicHttpClient(cfg *config.SDKConfig) *http.Client {
 	client := util.NewHTTPClient(util.DefaultHTTPClientTimeout)
 	client.Transport = newUtlsRoundTripper(cfg)
 	return client
+}
+
+type sourceIPDialer struct {
+	dialer     *net.Dialer
+	preferIPv4 bool
+}
+
+func newSourceIPDialer(sourceIP string, preferIPv4 bool) (proxy.Dialer, error) {
+	parsedIP := net.ParseIP(strings.TrimSpace(sourceIP))
+	if parsedIP == nil {
+		return nil, net.InvalidAddrError("invalid source ip")
+	}
+	if parsedIP = parsedIP.To4(); parsedIP == nil {
+		return nil, net.InvalidAddrError("source ip must be IPv4")
+	}
+	return &sourceIPDialer{
+		dialer: &net.Dialer{
+			Timeout:   util.DefaultHTTPDialTimeout,
+			KeepAlive: 30 * time.Second,
+			LocalAddr: &net.TCPAddr{IP: parsedIP},
+		},
+		preferIPv4: preferIPv4,
+	}, nil
+}
+
+func (d *sourceIPDialer) Dial(network, addr string) (net.Conn, error) {
+	if d == nil || d.dialer == nil {
+		return nil, net.InvalidAddrError("source ip dialer is nil")
+	}
+	if d.preferIPv4 {
+		network = "tcp4"
+	}
+	return d.dialer.Dial(network, addr)
 }

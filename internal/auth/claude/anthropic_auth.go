@@ -66,8 +66,16 @@ type ClaudeAuth struct {
 func NewClaudeAuth(cfg *config.Config) *ClaudeAuth {
 	// Use custom HTTP client with Firefox TLS fingerprint to bypass
 	// Cloudflare's bot detection on Anthropic domains
+	if cfg == nil {
+		return NewClaudeAuthWithSDKConfig(nil)
+	}
+	return NewClaudeAuthWithSDKConfig(&cfg.SDKConfig)
+}
+
+// NewClaudeAuthWithSDKConfig creates a new Claude auth service using only the SDK-level network config.
+func NewClaudeAuthWithSDKConfig(cfg *config.SDKConfig) *ClaudeAuth {
 	return &ClaudeAuth{
-		httpClient: NewAnthropicHttpClient(&cfg.SDKConfig),
+		httpClient: NewAnthropicHttpClient(cfg),
 	}
 }
 

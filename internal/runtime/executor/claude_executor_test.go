@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -33,6 +34,31 @@ func TestApplyClaudeToolPrefix(t *testing.T) {
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "proxy_delta" {
 		t.Fatalf("messages.0.content.0.name = %q, want %q", got, "proxy_delta")
+	}
+}
+
+func TestDecodeResponseBody_DecodesGzipWithoutHeader(t *testing.T) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(`{"ok":true}`)); err != nil {
+		t.Fatalf("write gzip payload: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close gzip payload: %v", err)
+	}
+
+	decoded, err := decodeResponseBody(io.NopCloser(bytes.NewReader(buf.Bytes())), "")
+	if err != nil {
+		t.Fatalf("decodeResponseBody returned error: %v", err)
+	}
+	defer func() { _ = decoded.Close() }()
+
+	body, err := io.ReadAll(decoded)
+	if err != nil {
+		t.Fatalf("read decoded body: %v", err)
+	}
+	if got := string(body); got != `{"ok":true}` {
+		t.Fatalf("decoded body = %q, want %q", got, `{"ok":true}`)
 	}
 }
 

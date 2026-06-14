@@ -542,7 +542,7 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	if refreshToken == "" {
 		return auth, nil
 	}
-	svc := claudeauth.NewClaudeAuth(e.cfg)
+	svc := claudeauth.NewClaudeAuthWithSDKConfig(resolveClaudeSDKConfig(e.cfg, auth))
 	td, err := svc.RefreshTokens(ctx, refreshToken)
 	if err != nil {
 		return nil, err
@@ -618,8 +618,28 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 	if body == nil {
 		return nil, fmt.Errorf("response body is nil")
 	}
+	buffered := bufio.NewReader(body)
+	if contentEncoding == "" && looksLikeGzipBuffered(buffered) {
+		gzipReader, err := gzip.NewReader(buffered)
+		if err != nil {
+			_ = body.Close()
+			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		return &compositeReadCloser{
+			Reader: gzipReader,
+			closers: []func() error{
+				gzipReader.Close,
+				func() error { return body.Close() },
+			},
+		}, nil
+	}
 	if contentEncoding == "" {
-		return body, nil
+		return &compositeReadCloser{
+			Reader: buffered,
+			closers: []func() error{
+				func() error { return body.Close() },
+			},
+		}, nil
 	}
 	encodings := strings.Split(contentEncoding, ",")
 	for _, raw := range encodings {
@@ -628,7 +648,7 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 		case "", "identity":
 			continue
 		case "gzip":
-			gzipReader, err := gzip.NewReader(body)
+			gzipReader, err := gzip.NewReader(buffered)
 			if err != nil {
 				_ = body.Close()
 				return nil, fmt.Errorf("failed to create gzip reader: %w", err)
@@ -641,7 +661,7 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 				},
 			}, nil
 		case "deflate":
-			deflateReader := flate.NewReader(body)
+			deflateReader := flate.NewReader(buffered)
 			return &compositeReadCloser{
 				Reader: deflateReader,
 				closers: []func() error{
@@ -651,13 +671,13 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 			}, nil
 		case "br":
 			return &compositeReadCloser{
-				Reader: brotli.NewReader(body),
+				Reader: brotli.NewReader(buffered),
 				closers: []func() error{
 					func() error { return body.Close() },
 				},
 			}, nil
 		case "zstd":
-			decoder, err := zstd.NewReader(body)
+			decoder, err := zstd.NewReader(buffered)
 			if err != nil {
 				_ = body.Close()
 				return nil, fmt.Errorf("failed to create zstd reader: %w", err)
@@ -673,7 +693,54 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 			continue
 		}
 	}
-	return body, nil
+	return &compositeReadCloser{
+		Reader: buffered,
+		closers: []func() error{
+			func() error { return body.Close() },
+		},
+	}, nil
+}
+
+func looksLikeGzipBuffered(reader *bufio.Reader) bool {
+	if reader == nil {
+		return false
+	}
+	header, err := reader.Peek(2)
+	if err != nil {
+		return false
+	}
+	return len(header) >= 2 && header[0] == 0x1f && header[1] == 0x8b
+}
+
+func resolveClaudeSDKConfig(cfg *config.Config, auth *cliproxyauth.Auth) *config.SDKConfig {
+	if cfg == nil {
+		return &config.SDKConfig{}
+	}
+	sdkCfg := cfg.SDKConfig
+	if auth == nil {
+		return &sdkCfg
+	}
+	sdkCfg.ProxyURL = resolveAuthProxyURL(cfg, auth)
+	return &sdkCfg
+}
+
+func resolveAuthProxyURL(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if cfg == nil && auth == nil {
+		return ""
+	}
+	if cfg != nil {
+		proxyID := ""
+		fallbackURL := ""
+		if auth != nil {
+			proxyID = auth.ProxyID
+			fallbackURL = auth.ProxyURL
+		}
+		return cfg.ResolveProxyURL(proxyID, fallbackURL)
+	}
+	if auth != nil {
+		return strings.TrimSpace(auth.ProxyURL)
+	}
+	return ""
 }
 
 // mapStainlessOS maps runtime.GOOS to Stainless SDK OS names.

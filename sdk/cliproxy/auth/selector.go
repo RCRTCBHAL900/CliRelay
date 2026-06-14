@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -507,9 +508,21 @@ func authMaxInFlight(auth *Auth) int {
 		return val
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
-		return defaultClaudeMaxInFlight
+		return defaultClaudeMaxInFlightLimit()
 	}
 	return 0
+}
+
+func defaultClaudeMaxInFlightLimit() int {
+	raw := strings.TrimSpace(os.Getenv("CLAUDE_DEFAULT_MAX_INFLIGHT"))
+	if raw == "" {
+		return defaultClaudeMaxInFlight
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 0 {
+		return defaultClaudeMaxInFlight
+	}
+	return parsed
 }
 
 func authIntSetting(auth *Auth, keys ...string) (int, bool) {
