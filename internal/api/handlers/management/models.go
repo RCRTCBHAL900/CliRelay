@@ -346,6 +346,84 @@ func (h *Handler) PutModelOwnerPresets(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "updated": len(body.Items)})
 }
 
+func authGroupModelOwnerMappingResponse(row usage.AuthGroupModelOwnerMappingRow) map[string]any {
+	return map[string]any{
+		"auth_group": row.AuthGroup,
+		"owner":      row.Owner,
+		"updated_at": row.UpdatedAt,
+	}
+}
+
+// GetAuthGroupModelOwnerMappings returns auth-group -> owner mappings used by the
+// management panel to infer model ownership for auth-file groups.
+//
+// Endpoint:
+//
+//	GET /v0/management/auth-group-model-owner-mappings
+func (h *Handler) GetAuthGroupModelOwnerMappings(c *gin.Context) {
+	rows := usage.ListAuthGroupModelOwnerMappings()
+	items := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, authGroupModelOwnerMappingResponse(row))
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"items": items,
+		"data":  items,
+	})
+}
+
+// PatchAuthGroupModelOwnerMappings upserts or clears a single auth-group owner mapping.
+//
+// Endpoint:
+//
+//	PATCH /v0/management/auth-group-model-owner-mappings
+func (h *Handler) PatchAuthGroupModelOwnerMappings(c *gin.Context) {
+	var body struct {
+		AuthGroup string `json:"auth_group"`
+		Owner     string `json:"owner"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	authGroup := strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(body.AuthGroup)), "-"))
+	if authGroup == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth_group is required"})
+		return
+	}
+	if authGroup == "all" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth_group 'all' is reserved"})
+		return
+	}
+	owner := strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(body.Owner)), "-"))
+	if owner == "" {
+		if err := usage.DeleteAuthGroupModelOwnerMapping(authGroup); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status":     "ok",
+			"auth_group": authGroup,
+			"deleted":    true,
+		})
+		return
+	}
+
+	row := usage.AuthGroupModelOwnerMappingRow{
+		AuthGroup: authGroup,
+		Owner:     owner,
+	}
+	if err := usage.UpsertAuthGroupModelOwnerMapping(row); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	saved, _ := usage.GetAuthGroupModelOwnerMapping(authGroup)
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"item":   authGroupModelOwnerMappingResponse(saved),
+	})
+}
+
 // GetModelPricing returns all model pricing entries.
 //
 // Endpoint:

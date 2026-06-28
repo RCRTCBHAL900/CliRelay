@@ -101,6 +101,37 @@ func TestDeleteModelConfigRemovesConfigAndPricing(t *testing.T) {
 	}
 }
 
+func TestAuthGroupModelOwnerMappingLifecycle(t *testing.T) {
+	initModelConfigTestDB(t)
+
+	if err := UpsertAuthGroupModelOwnerMapping(AuthGroupModelOwnerMappingRow{
+		AuthGroup: "Gemini Canary",
+		Owner:     "OpenAI",
+	}); err != nil {
+		t.Fatalf("UpsertAuthGroupModelOwnerMapping() error = %v", err)
+	}
+
+	row, ok := GetAuthGroupModelOwnerMapping("gemini canary")
+	if !ok {
+		t.Fatal("expected auth-group owner mapping")
+	}
+	if row.AuthGroup != "gemini-canary" || row.Owner != "openai" {
+		t.Fatalf("unexpected auth-group owner mapping: %+v", row)
+	}
+
+	rows := ListAuthGroupModelOwnerMappings()
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 auth-group owner mapping, got %d", len(rows))
+	}
+
+	if err := DeleteAuthGroupModelOwnerMapping("gemini canary"); err != nil {
+		t.Fatalf("DeleteAuthGroupModelOwnerMapping() error = %v", err)
+	}
+	if _, ok := GetAuthGroupModelOwnerMapping("gemini-canary"); ok {
+		t.Fatal("expected auth-group owner mapping to be deleted")
+	}
+}
+
 func TestInitDBMergesLegacyPricingWithoutDeadlock(t *testing.T) {
 	CloseDB()
 	dbPath := filepath.Join(t.TempDir(), "usage.db")

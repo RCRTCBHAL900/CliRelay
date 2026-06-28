@@ -233,6 +233,63 @@ func TestModelOwnerPresetHandlersReplacePresets(t *testing.T) {
 	}
 }
 
+func TestAuthGroupModelOwnerMappingHandlersPatchListAndDelete(t *testing.T) {
+	initManagementModelsTestDB(t)
+	h := NewHandler(&config.Config{}, "", nil)
+
+	patchBody := []byte(`{
+		"auth_group": "gemini canary",
+		"owner": "OpenAI"
+	}`)
+	patchRec := performModelsRequest(http.MethodPatch, "/auth-group-model-owner-mappings", patchBody, h.PatchAuthGroupModelOwnerMappings)
+	if patchRec.Code != http.StatusOK {
+		t.Fatalf("PatchAuthGroupModelOwnerMappings status = %d body = %s", patchRec.Code, patchRec.Body.String())
+	}
+
+	var patchPayload struct {
+		Item struct {
+			AuthGroup string `json:"auth_group"`
+			Owner     string `json:"owner"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(patchRec.Body.Bytes(), &patchPayload); err != nil {
+		t.Fatalf("unmarshal patch response: %v", err)
+	}
+	if patchPayload.Item.AuthGroup != "gemini-canary" || patchPayload.Item.Owner != "openai" {
+		t.Fatalf("unexpected patch payload: %+v", patchPayload.Item)
+	}
+
+	getRec := performModelsRequest(http.MethodGet, "/auth-group-model-owner-mappings", nil, h.GetAuthGroupModelOwnerMappings)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GetAuthGroupModelOwnerMappings status = %d body = %s", getRec.Code, getRec.Body.String())
+	}
+
+	var getPayload struct {
+		Items []struct {
+			AuthGroup string `json:"auth_group"`
+			Owner     string `json:"owner"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(getRec.Body.Bytes(), &getPayload); err != nil {
+		t.Fatalf("unmarshal get response: %v", err)
+	}
+	if len(getPayload.Items) != 1 || getPayload.Items[0].AuthGroup != "gemini-canary" || getPayload.Items[0].Owner != "openai" {
+		t.Fatalf("unexpected get payload: %+v", getPayload.Items)
+	}
+
+	clearBody := []byte(`{
+		"auth_group": "gemini-canary",
+		"owner": ""
+	}`)
+	clearRec := performModelsRequest(http.MethodPatch, "/auth-group-model-owner-mappings", clearBody, h.PatchAuthGroupModelOwnerMappings)
+	if clearRec.Code != http.StatusOK {
+		t.Fatalf("clear PatchAuthGroupModelOwnerMappings status = %d body = %s", clearRec.Code, clearRec.Body.String())
+	}
+	if _, ok := usage.GetAuthGroupModelOwnerMapping("gemini-canary"); ok {
+		t.Fatal("expected auth-group owner mapping to be cleared")
+	}
+}
+
 func TestOpenRouterModelSyncHandlersConfigureAndRun(t *testing.T) {
 	initManagementModelsTestDB(t)
 	h := NewHandler(&config.Config{}, "", nil)

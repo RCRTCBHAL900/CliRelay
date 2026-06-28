@@ -34,6 +34,12 @@ type ModelOwnerPresetRow struct {
 	UpdatedAt   string `json:"updated_at"`
 }
 
+type AuthGroupModelOwnerMappingRow struct {
+	AuthGroup string `json:"auth_group"`
+	Owner     string `json:"owner"`
+	UpdatedAt string `json:"updated_at"`
+}
+
 const createModelConfigTablesSQL = `
 CREATE TABLE IF NOT EXISTS model_configs (
   model_id                 TEXT PRIMARY KEY,
@@ -59,6 +65,12 @@ CREATE TABLE IF NOT EXISTS model_owner_presets (
   updated_at  DATETIME NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS auth_group_model_owner_mappings (
+  auth_group  TEXT PRIMARY KEY,
+  owner       TEXT NOT NULL DEFAULT '',
+  updated_at  DATETIME NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS model_openrouter_sync_state (
   id               INTEGER PRIMARY KEY CHECK(id = 1),
   enabled          INTEGER NOT NULL DEFAULT 0,
@@ -80,6 +92,9 @@ var (
 
 	modelOwnerPresetCache   map[string]ModelOwnerPresetRow
 	modelOwnerPresetCacheMu sync.RWMutex
+
+	authGroupModelOwnerMappingCache   map[string]AuthGroupModelOwnerMappingRow
+	authGroupModelOwnerMappingCacheMu sync.RWMutex
 )
 
 var defaultOwnerLabels = map[string]string{
@@ -114,9 +129,14 @@ func initModelConfigTables(db *sql.DB) {
 	mergeLegacyPricingIntoModelConfigs(db)
 	reloadModelConfigCache(db)
 	reloadModelOwnerPresetCache(db)
+	reloadAuthGroupModelOwnerMappingCache(db)
 }
 
 func normalizeModelOwnerValue(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), "-"))
+}
+
+func normalizeAuthGroupValue(value string) string {
 	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), "-"))
 }
 
@@ -392,6 +412,34 @@ func reloadModelOwnerPresetCache(db *sql.DB) {
 	log.Infof("usage: loaded %d model owner presets into cache", len(cache))
 }
 
+func reloadAuthGroupModelOwnerMappingCache(db *sql.DB) {
+	rows, err := db.Query("SELECT auth_group, owner, updated_at FROM auth_group_model_owner_mappings")
+	if err != nil {
+		log.Errorf("usage: load auth-group owner mappings: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	cache := make(map[string]AuthGroupModelOwnerMappingRow)
+	for rows.Next() {
+		var row AuthGroupModelOwnerMappingRow
+		if err := rows.Scan(&row.AuthGroup, &row.Owner, &row.UpdatedAt); err != nil {
+			log.Errorf("usage: scan auth-group owner mapping row: %v", err)
+			continue
+		}
+		row.AuthGroup = normalizeAuthGroupValue(row.AuthGroup)
+		row.Owner = normalizeModelOwnerValue(row.Owner)
+		if row.AuthGroup == "" || row.Owner == "" {
+			continue
+		}
+		cache[row.AuthGroup] = row
+	}
+	authGroupModelOwnerMappingCacheMu.Lock()
+	authGroupModelOwnerMappingCache = cache
+	authGroupModelOwnerMappingCacheMu.Unlock()
+	log.Infof("usage: loaded %d auth-group owner mappings into cache", len(cache))
+}
+
 func upsertLegacyPricingIntoModelConfig(db *sql.DB, modelID string, input, output, cached float64, updatedAt string) {
 	if db == nil {
 		return
@@ -636,5 +684,75 @@ func ReplaceModelOwnerPresets(rows []ModelOwnerPresetRow) error {
 		return fmt.Errorf("usage: commit owner preset replace: %w", err)
 	}
 	reloadModelOwnerPresetCache(db)
+	return nil
+}
+
+func ListAuthGroupModelOwnerMappings() []AuthGroupModelOwnerMappingRow {
+	authGroupModelOwnerMappingCacheMu.RLock()
+	defer authGroupModelOwnerMappingCacheMu.RUnlock()
+	result := make([]AuthGroupModelOwnerMappingRow, 0, len(authGroupModelOwnerMappingCache))
+	for _, row := range authGroupModelOwnerMappingCache {
+		result = append(result, row)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].AuthGroup < result[j].AuthGroup
+	})
+	return result
+}
+
+func GetAuthGroupModelOwnerMapping(authGroup string) (AuthGroupModelOwnerMappingRow, bool) {
+	authGroupModelOwnerMappingCacheMu.RLock()
+	defer authGroupModelOwnerMappingCacheMu.RUnlock()
+	row, ok := authGroupModelOwnerMappingCache[normalizeAuthGroupValue(authGroup)]
+	return row, ok
+}
+
+func UpsertAuthGroupModelOwnerMapping(row AuthGroupModelOwnerMappingRow) error {
+	db := getDB()
+	if db == nil {
+		return fmt.Errorf("usage: database not initialised")
+	}
+	row.AuthGroup = normalizeAuthGroupValue(row.AuthGroup)
+	row.Owner = normalizeModelOwnerValue(row.Owner)
+	if row.AuthGroup == "" {
+		return fmt.Errorf("usage: auth group is required")
+	}
+	if row.AuthGroup == "all" {
+		return fmt.Errorf("usage: auth group 'all' is reserved")
+	}
+	if row.Owner == "" {
+		return fmt.Errorf("usage: owner is required")
+	}
+	row.UpdatedAt = nowRFC3339()
+	_, err := db.Exec(
+		`INSERT INTO auth_group_model_owner_mappings (auth_group, owner, updated_at)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT(auth_group) DO UPDATE SET
+		   owner = excluded.owner,
+		   updated_at = excluded.updated_at`,
+		row.AuthGroup,
+		row.Owner,
+		row.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("usage: upsert auth-group owner mapping: %w", err)
+	}
+	reloadAuthGroupModelOwnerMappingCache(db)
+	return nil
+}
+
+func DeleteAuthGroupModelOwnerMapping(authGroup string) error {
+	db := getDB()
+	if db == nil {
+		return fmt.Errorf("usage: database not initialised")
+	}
+	authGroup = normalizeAuthGroupValue(authGroup)
+	if authGroup == "" {
+		return fmt.Errorf("usage: auth group is required")
+	}
+	if _, err := db.Exec("DELETE FROM auth_group_model_owner_mappings WHERE auth_group = ?", authGroup); err != nil {
+		return fmt.Errorf("usage: delete auth-group owner mapping: %w", err)
+	}
+	reloadAuthGroupModelOwnerMappingCache(db)
 	return nil
 }

@@ -625,6 +625,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/model-configs/*id", s.mgmt.DeleteModelConfig)
 		mgmt.GET("/model-owner-presets", s.mgmt.GetModelOwnerPresets)
 		mgmt.PUT("/model-owner-presets", s.mgmt.PutModelOwnerPresets)
+		mgmt.GET("/auth-group-model-owner-mappings", s.mgmt.GetAuthGroupModelOwnerMappings)
+		mgmt.PATCH("/auth-group-model-owner-mappings", s.mgmt.PatchAuthGroupModelOwnerMappings)
 		mgmt.GET("/model-openrouter-sync", s.mgmt.GetOpenRouterModelSync)
 		mgmt.PUT("/model-openrouter-sync", s.mgmt.PutOpenRouterModelSync)
 		mgmt.POST("/model-openrouter-sync/run", s.mgmt.PostOpenRouterModelSyncRun)
